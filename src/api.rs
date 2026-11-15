@@ -20,14 +20,14 @@ const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
 /// Claude Code treats a lock older than this as abandoned.
 const LOCK_STALE: Duration = Duration::from_secs(60);
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Limit {
     pub percent: f64,
     /// Unix seconds.
     pub resets_at: Option<i64>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct Usage {
     pub five_hour: Option<Limit>,
     /// The plan has a 5-hour limit, even if this response gave no number for it.
@@ -35,6 +35,16 @@ pub struct Usage {
     pub weekly: Option<Limit>,
     /// Fable's own weekly limit, on plans that have one.
     pub fable: Option<Limit>,
+    /// All additional model-scoped and top-level quota windows.
+    pub extra: Vec<ExtraLimit>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExtraLimit {
+    pub key: String,
+    pub label: String,
+    pub limit: Limit,
+    pub window_secs: i64,
 }
 
 pub enum FetchError {
@@ -281,6 +291,7 @@ pub fn fake_usage() -> Usage {
         has_five_hour: true,
         weekly: Some(limit(7 * 86400)),
         fable: Some(limit(7 * 86400)),
+        extra: vec![ExtraLimit { key: "opus".into(), label: "Opus".into(), limit: limit(7 * 86400), window_secs: 7 * 86400 }],
     }
 }
 
@@ -303,7 +314,7 @@ pub fn fetch(dir: &Path) -> Result<Usage, FetchError> {
     Ok(parse_usage(&v))
 }
 
-fn parse_usage(v: &Value) -> Usage {
+pub(crate) fn parse_usage(v: &Value) -> Usage {
     let limit = |key: &str| -> Option<Limit> {
         let o = v.get(key)?;
         Some(Limit {
@@ -313,11 +324,33 @@ fn parse_usage(v: &Value) -> Usage {
     };
     // Per-model weekly limits come as a list, the way Claude Code reads them:
     // {kind: "weekly_scoped", scope: {model: {display_name}}, percent, resets_at}.
+    let mut extra = Vec::new();
+    if let Some(o) = v.as_object() {
+        for (key, val) in o {
+            if matches!(key.as_str(), "five_hour" | "seven_day" | "limits") || !val.is_object() || val.get("utilization").is_none() { continue; }
+            if let Some(l) = limit(key) {
+                let label = key.trim_start_matches("seven_day_").replace('_', " ");
+                extra.push(ExtraLimit { key: key.clone(), label, limit: l, window_secs: 7 * 86400 });
+            }
+        }
+    }
+    if let Some(limits) = v["limits"].as_array() {
+        for item in limits {
+            if item["kind"].as_str() != Some("weekly_scoped") { continue; }
+            let Some(label) = item["scope"]["model"]["display_name"].as_str() else { continue };
+            let Some(percent) = item["percent"].as_f64().or_else(|| item["utilization"].as_f64()) else { continue };
+            let at=&item["resets_at"];
+            let limit=Limit { percent, resets_at: at.as_i64().or_else(||at.as_str().and_then(parse_iso8601)) };
+            let key=label.to_ascii_lowercase().replace(' ', "_");
+            if !extra.iter().any(|e| e.key == key) { extra.push(ExtraLimit { key, label: label.into(), limit, window_secs: 7 * 86400 }); }
+        }
+    }
     Usage {
         five_hour: limit("five_hour"),
         has_five_hour: v["five_hour"].is_object(),
         weekly: limit("seven_day"),
         fable: fable_limit(v),
+        extra,
     }
 }
 
@@ -336,7 +369,7 @@ fn fable_limit(v: &Value) -> Option<Limit> {
 }
 
 /// Parses e.g. "2026-11-11T14:10:00.320228+00:00" into unix seconds.
-fn parse_iso8601(s: &str) -> Option<i64> {
+pub(crate) fn parse_iso8601(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     let num = |r: std::ops::Range<usize>| -> Option<i64> { s.get(r)?.parse().ok() };
     let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
@@ -398,5 +431,15 @@ mod tests {
         assert_eq!(super::parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(super::parse_iso8601("2026-11-11T14:10:00.320228+00:00"), Some(1794406200));
         assert_eq!(super::parse_iso8601("2026-11-11T16:10:00+02:00"), Some(1794406200));
+    }
+
+    #[test]
+    fn discovers_extra_quotas() {
+        let u=super::parse_usage(&serde_json::json!({
+            "seven_day_opus":{"utilization":22.0,"resets_at":"1970-01-02T00:00:00Z"},
+            "limits":[{"kind":"weekly_scoped","scope":{"model":{"display_name":"Sonnet Pro"}},"percent":31.0,"resets_at":90000}]
+        }));
+        assert!(u.extra.iter().any(|x|x.key=="seven_day_opus"&&x.limit.percent==22.0));
+        assert!(u.extra.iter().any(|x|x.label=="Sonnet Pro"&&x.limit.percent==31.0));
     }
 }

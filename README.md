@@ -1,8 +1,6 @@
-[![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/AbdoSarmini/claude-usage-widget-for-windows-taskbar/total?style=for-the-badge&logo=claudecode&logoColor=white&labelColor=%23C15F3C)
-](https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar/releases/latest/download/ClaudeUsageWidget.exe)
-# Claude Usage Widget For Windows Taskbar
+# Taskbar Usage Widget
 
-See your Claude **5-hour** and **weekly** usage right on the Windows 11 taskbar, next to the clock.
+See Claude and Codex quota pace plus live Spark inference status on the Windows taskbar.
 
 <p>
   <img src="docs/screenshot-light.png" alt="Widget on a light taskbar" width="490"><br>
@@ -22,7 +20,8 @@ One small file (~450 KB). No installer, nothing else to download.
 - Follows your light or dark Windows theme.
 - Multiple Claude Code accounts at once.
 - Customizable size, icon, labels and rings.
-- Updates itself with one click (only when you ask).
+- Shows all Claude quota types, Codex 5-hour/weekly windows, pace markers and forecasts.
+- Shows Spark throughput, GPU activity, busy/down state, and a ten-minute sparkline.
 
 ## Requirements
 
@@ -33,7 +32,7 @@ API keys and the Claude desktop app / claude.ai alone aren't supported.
 
 ## Install
 
-1. Download the exe and put it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\ClaudeUsageWidget\`.
+1. Put `taskbar-usage-widget.exe` somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\TaskbarUsageWidget\`.
 2. Double-click it. The widget appears left of the tray icons.
 3. Right-click it and tick **Start with Windows**.
 
@@ -44,7 +43,7 @@ API keys and the Claude desktop app / claude.ai alone aren't supported.
 <img src="docs/screenshot-menu.png" alt="The widget's right-click menu" width="377">
 
 - **Hover** for details, **left-click** to open your usage page on claude.ai.
-- **Right-click** for everything else: update interval, show remaining instead of used, customize the look, add accounts, start with Windows, check for updates and exit.
+- **Right-click** to show or hide providers, set the Spark address, refresh, customize the look, manage Claude accounts, start with Windows, or exit.
 
 ### Multiple accounts
 
@@ -61,11 +60,11 @@ If you run Claude Code with another config folder (e.g. `CLAUDE_CONFIG_DIR=$HOME
 
 ## Privacy
 
-Your usage is read from Anthropic (`api.anthropic.com`, `platform.claude.com`), the same servers Claude Code uses. Update checks go to GitHub. Your login stays on your PC. No analytics or telemetry.
+Claude usage is read from `api.anthropic.com` and `platform.claude.com`. Codex usage is read locally from only `token_count` events in `%CODEX_HOME%\sessions` (or `%USERPROFILE%\.codex\sessions`); conversation text is never copied. Spark stats are requested only from the LAN host you configure. The widget writes `%LOCALAPPDATA%\TaskbarUsageWidget\state.json` and `history.jsonl`, plus settings under `HKEY_CURRENT_USER\Software\TaskbarUsageWidget`. OAuth tokens are never logged or stored in those files. There are no analytics or update checks.
 
 ## Uninstall
 
-Untick **Start with Windows**, click **Exit**, and delete the exe. Settings live in `HKEY_CURRENT_USER\Software\ClaudeUsageWidget`.
+Untick **Start with Windows**, click **Exit**, and delete the exe. Settings live in `HKEY_CURRENT_USER\Software\TaskbarUsageWidget`.
 
 ## Build from source
 
@@ -84,3 +83,5 @@ Unofficial community project, not affiliated with or endorsed by Anthropic. "Cla
 ## License
 
 [MIT](LICENSE)
+
+Based on [Claude Usage Widget for Windows Taskbar](https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar) by Abdo Sarmini, used under the MIT License.

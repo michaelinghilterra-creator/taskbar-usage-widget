@@ -1,4 +1,4 @@
-//! Minimal HTTPS client on top of WinHTTP (ships with Windows, no TLS crate needed).
+//! Minimal HTTP/HTTPS client on top of WinHTTP (ships with Windows, no TLS crate needed).
 
 use std::ffi::c_void;
 use std::ptr::null;
@@ -42,10 +42,15 @@ pub fn request(
     headers: &str,
     body: Option<&[u8]>,
 ) -> Result<Response, String> {
+    request_to(method, host, 443, path, headers, body, true, 15_000)
+}
+
+pub fn request_to(method: &str, host_port: &str, default_port: u16, path: &str, headers: &str, body: Option<&[u8]>, secure: bool, timeout_ms: i32) -> Result<Response, String> {
+    let (host, port) = host_port.rsplit_once(':').and_then(|(h,p)| p.parse::<u16>().ok().map(|p|(h,p))).unwrap_or((host_port,default_port));
     unsafe {
         let session = check(
             WinHttpOpen(
-                wide("claude-usage-widget/1.0").as_ptr(),
+                wide("taskbar-usage-widget/1.0").as_ptr(),
                 WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                 null(),
                 null(),
@@ -53,9 +58,9 @@ pub fn request(
             ),
             "WinHttpOpen",
         )?;
-        WinHttpSetTimeouts(session.0, 10_000, 10_000, 15_000, 15_000);
+        WinHttpSetTimeouts(session.0, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
         let conn = check(
-            WinHttpConnect(session.0, wide(host).as_ptr(), 443, 0),
+            WinHttpConnect(session.0, wide(host).as_ptr(), port, 0),
             "connect",
         )?;
         let req = check(
@@ -66,7 +71,7 @@ pub fn request(
                 null(),
                 null(),
                 null(),
-                WINHTTP_FLAG_SECURE,
+                if secure { WINHTTP_FLAG_SECURE } else { 0 },
             ),
             "open request",
         )?;

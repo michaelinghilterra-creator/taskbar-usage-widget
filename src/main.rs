@@ -2,8 +2,9 @@
 
 mod api;
 mod http;
+mod providers;
 mod render;
-mod update;
+mod storage;
 
 use http::wide;
 use std::cell::{Cell, RefCell};
@@ -30,19 +31,23 @@ use windows_sys::core::w;
 
 const WM_APP_RESULT: u32 = WM_APP + 1;
 const WM_APP_CSWAP: u32 = WM_APP + 2; // claude-swap finished; lparam: Box<Result<(), String>>
-const WM_APP_UPDATE: u32 = WM_APP + 3; // update check or install finished; lparam: Box<UpdateMsg>
+const WM_APP_PROVIDER: u32 = WM_APP + 3;
 const T_LAYOUT: usize = 1; // keeps the widget attached and positioned
 const T_ROLL: usize = 5; // animation frames while numbers roll
 /// How long a changed number rolls.
 const ROLL_SECS: f32 = 0.45;
 const T_TICK: usize = 3; // refreshes tooltip countdowns
-const T_UPDATE: usize = 4; // one-shot: next check for a new release
+const T_PROVIDER: usize = 4;
+const T_SPARK_PULSE: usize = 6;
 const T_FETCH_BASE: usize = 1000; // + account id, one-shot: that account's next fetch
 
 const ID_REFRESH: usize = 1;
 const ID_OPEN: usize = 2;
 const ID_CSWAP: usize = 9;
-const ID_UPDATE: usize = 10;
+const ID_SHOW_CLAUDE: usize = 24;
+const ID_SHOW_CODEX: usize = 25;
+const ID_SHOW_SPARK: usize = 26;
+const ID_SPARK_ADDRESS: usize = 27;
 const ID_AUTOSTART: usize = 3;
 const ID_EXIT: usize = 4;
 const ID_SHOW_LEFT: usize = 5;
@@ -105,8 +110,8 @@ use render::DEFAULT_FONT_SIZE;
 
 const USAGE_URL: &str = "https://claude.ai/settings/usage";
 const RUN_KEY: *const u16 = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE: *const u16 = w!("ClaudeUsageWidget");
-const SETTINGS_KEY: *const u16 = w!("Software\\ClaudeUsageWidget");
+const RUN_VALUE: *const u16 = w!("TaskbarUsageWidget");
+const SETTINGS_KEY: *const u16 = w!("Software\\TaskbarUsageWidget");
 
 #[derive(Clone, PartialEq)]
 struct RenderKey {
@@ -133,6 +138,7 @@ struct RenderKey {
     hide_week: bool,
     hide_fable: bool,
     rows_per_col: u32,
+    providers: (bool, bool, bool, Option<i64>, Option<i64>, u8),
 }
 
 /// One Claude Code login, found in its config folder.
@@ -206,6 +212,17 @@ struct State {
     hide_fable: bool,
     /// Accounts stacked in each column of the widget.
     rows_per_col: u32,
+    show_claude: bool,
+    show_codex: bool,
+    show_spark: bool,
+    spark_host: String,
+    codex: Option<providers::Reading>,
+    codex_sig: Vec<(PathBuf, u64, i64)>,
+    codex_checked_at: i64,
+    spark: Option<providers::SparkSnapshot>,
+    spark_history: Vec<(i64, f64, f64)>,
+    history: Option<storage::History>,
+    group_ranges: Vec<render::GroupRange>,
     /// Dev only: random usage instead of the API.
     fake_data: bool,
     /// Dev only: the tooltip shown while hovering a menu item.
@@ -214,10 +231,6 @@ struct State {
     cswap: Option<PathBuf>,
     /// A `cswap switch` is running.
     cswap_running: bool,
-    /// A newer release, once a check found one.
-    update: Option<update::Release>,
-    /// What the updater is doing, shown greyed out in the menu.
-    update_busy: Option<&'static str>,
 }
 
 thread_local! {
@@ -227,8 +240,9 @@ thread_local! {
         hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
         font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, ring_margin: DEFAULT_RING_MARGIN, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
+        show_claude: true, show_codex: true, show_spark: true, spark_host: String::new(), codex: None, codex_sig: Vec::new(), codex_checked_at: 0, spark: None, spark_history: Vec::new(), history: None, group_ranges: Vec::new(),
         fake_data: false, menu_tip: null_mut(),
-        cswap: None, cswap_running: false, update: None, update_busy: None,
+        cswap: None, cswap_running: false,
     });
 }
 
@@ -242,32 +256,15 @@ fn now() -> i64 {
 
 fn main() {
     unsafe {
-        // Single instance. Right after an update the previous copy may still
-        // be exiting, so the new one waits for it instead of quitting.
-        let after_update = std::env::args().any(|a| a == update::UPDATED_ARG);
-        let mut tries = 0;
-        loop {
-            let m = CreateMutexW(null(), 0, w!("Local\\ClaudeUsageWidget.Singleton"));
-            if GetLastError() != ERROR_ALREADY_EXISTS {
-                break;
-            }
-            CloseHandle(m);
-            tries += 1;
-            if !after_update || tries > 50 {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            std::thread::spawn(move || update::clean_up_old(&exe));
-        }
+        let m = CreateMutexW(null(), 0, w!("Local\\TaskbarUsageWidget.Singleton"));
+        if GetLastError() == ERROR_ALREADY_EXISTS { CloseHandle(m); return; }
         // The folder picker needs COM on this thread.
         CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
         let hinst = GetModuleHandleW(null());
         let cursor = LoadCursorW(null_mut(), IDC_ARROW);
         for (name, proc_) in [
-            (w!("ClaudeUsageCtl"), Some(ctl_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT)),
-            (w!("ClaudeUsageWidget"), Some(widget_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT)),
+            (w!("TaskbarUsageCtl"), Some(ctl_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT)),
+            (w!("TaskbarUsageWidget"), Some(widget_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT)),
         ] {
             let wc = WNDCLASSW {
                 lpfnWndProc: proc_,
@@ -287,7 +284,7 @@ fn main() {
         // Hidden top-level window: owns timers and receives broadcasts
         // (TaskbarCreated, theme changes) that a taskbar child would not.
         let ctl = CreateWindowExW(
-            WS_EX_TOOLWINDOW, w!("ClaudeUsageCtl"), w!("Claude Usage Widget"), WS_POPUP,
+            WS_EX_TOOLWINDOW, w!("TaskbarUsageCtl"), w!("Taskbar Usage Widget"), WS_POPUP,
             0, 0, 0, 0, null_mut(), null_mut(), hinst, null(),
         );
         let msg = RegisterWindowMessageW(w!("TaskbarCreated"));
@@ -322,6 +319,10 @@ fn main() {
             s.hide_week = read_setting("HideWeekly") == Some(1);
             s.hide_fable = read_setting("HideFable") == Some(1);
             s.fake_data = DEV && read_setting("FakeData") == Some(1);
+            s.show_claude = read_setting("ShowClaude") != Some(0);
+            s.show_codex = read_setting("ShowCodex") != Some(0);
+            s.show_spark = read_setting("ShowSpark") != Some(0);
+            s.spark_host = read_string_setting("SparkHost").unwrap_or_default();
             s.cswap = find_cswap();
             s.rows_per_col = read_setting("AccountsPerColumn")
                 .filter(|v| (1..=render::MAX_ROWS_PER_COLUMN as u32).contains(v))
@@ -335,8 +336,10 @@ fn main() {
         ensure_widget();
         SetTimer(ctl, T_LAYOUT, 1000, None);
         SetTimer(ctl, T_TICK, 30_000, None);
-        SetTimer(ctl, T_UPDATE, UPDATE_FIRST_CHECK_MS, None);
+        with(|s| s.history = storage::History::load(now()).ok());
+        SetTimer(ctl, T_PROVIDER, provider_poll_ms(), None);
         start_fetch_all();
+        start_provider_fetch();
 
         let mut m: MSG = std::mem::zeroed();
         while GetMessageW(&mut m, null_mut(), 0, 0) > 0 {
@@ -390,7 +393,7 @@ fn on_result(res: FetchResult) {
         let limited = matches!(res.r, Err(api::FetchError::RateLimited));
         match res.r {
             Ok(u) => {
-                a.prev = a.usage.filter(|_| roll).map(|old| (old, Instant::now()));
+                a.prev = a.usage.clone().filter(|_| roll).map(|old| (old, Instant::now()));
                 a.usage = Some(u);
                 a.last_ok = Some(now());
                 a.error = None;
@@ -413,6 +416,7 @@ fn on_result(res: FetchResult) {
     }
     ensure_widget();
     update_tooltip();
+    with(|s| persist_state(s,now()));
 }
 
 /// Wait before the next fetch. Normally the user's interval. After rate-limit
@@ -441,7 +445,7 @@ fn ensure_widget() {
             }
             widget = CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                w!("ClaudeUsageWidget"), w!("Claude Usage"),
+                w!("TaskbarUsageWidget"), w!("Taskbar Usage Widget"),
                 WS_CHILD | WS_CLIPSIBLINGS,
                 0, 0, 1, 1, taskbar, null_mut(), GetModuleHandleW(null()), null(),
             );
@@ -480,23 +484,27 @@ fn ensure_widget() {
                 .accounts
                 .iter()
                 .map(|a| {
-                    let u = a.usage.unwrap_or_default();
+                    let u = a.usage.clone().unwrap_or_default();
                     render::Row {
                         five: u.five_hour.map(|l| l.percent),
                         week: u.weekly.map(|l| l.percent),
                         fable: u.fable.map(|l| l.percent),
-                        roll: a.prev.and_then(|(o, at)| {
+                        roll: a.prev.as_ref().and_then(|(o, at)| {
                             let t = at.elapsed().as_secs_f32() / ROLL_SECS;
                             let pct = |l: Option<api::Limit>| l.map(|l| l.percent);
                             (t < 1.0).then_some(([pct(o.five_hour), pct(o.weekly), pct(o.fable)], t))
                         }),
                         stale: a.is_stale(),
+                        pace: [u.five_hour.and_then(|l|l.resets_at.map(|r|providers::pace(l.percent,Some(r),Some(18000),now(),None).elapsed_frac as f32)),u.weekly.and_then(|l|l.resets_at.map(|r|providers::pace(l.percent,Some(r),Some(604800),now(),None).elapsed_frac as f32)),u.fable.and_then(|l|l.resets_at.map(|r|providers::pace(l.percent,Some(r),Some(604800),now(),None).elapsed_frac as f32))],
+                        projected: [u.five_hour.map(|l|providers::pace(l.percent,l.resets_at,Some(18000),now(),None).projected as f32),u.weekly.map(|l|providers::pace(l.percent,l.resets_at,Some(604800),now(),None).projected as f32),u.fable.map(|l|providers::pace(l.percent,l.resets_at,Some(604800),now(),None).projected as f32)],
+                        text: [None, None, None],
+                        critical: [false; 3],
                     }
                 })
                 .collect();
             // Plans without a 5-hour limit (Ultra) report none: hide the group
             // on its own once every loaded account says so.
-            let mut loaded = s.accounts.iter().filter_map(|a| a.usage).peekable();
+            let mut loaded = s.accounts.iter().filter_map(|a| a.usage.as_ref()).peekable();
             let hide_five = s.hide_five || (loaded.peek().is_some() && loaded.all(|u| !u.has_five_hour));
             let key = RenderKey {
                 h,
@@ -527,7 +535,50 @@ fn ensure_widget() {
                 hide_week: s.hide_week,
                 hide_fable: s.hide_fable,
                 rows_per_col: s.rows_per_col,
+                providers: (
+                    s.show_claude,
+                    s.show_codex,
+                    s.show_spark,
+                    s.codex
+                        .as_ref()
+                        .and_then(|reading| reading.windows.first())
+                        .map(|window| window.percent.round() as i64),
+                    s.spark.as_ref().map(|spark| spark.tok_s.round() as i64),
+                    if s.spark.as_ref().is_some_and(|spark| spark.busy) {
+                        (spark_pulse_alpha() * 100.0) as u8
+                    } else {
+                        0
+                    },
+                ),
             };
+            let codex_rows=s.codex.as_ref().map(|c|{
+                let find=|k:&str|c.windows.iter().find(|w|w.key==k);
+                let mk=|w:Option<&providers::Window>|w.map(|x|x.percent);
+                let pp=|w:Option<&providers::Window>|w.map(|x|providers::pace(x.percent,x.resets_at,x.window_secs,now(),None));
+                let f=find("5h");let w=find("week");let pf=pp(f);let pw=pp(w);
+                vec![render::Row{five:mk(f),week:mk(w),fable:None,roll:None,stale:c.error.is_some()||now()-c.as_of>21600,pace:[pf.map(|p|p.elapsed_frac as f32),pw.map(|p|p.elapsed_frac as f32),None],projected:[pf.map(|p|p.projected as f32),pw.map(|p|p.projected as f32),None],text:[None,None,None],critical:[false;3]}]
+            }).unwrap_or_default();
+            let spark_row = s.spark.as_ref().map(|spark| {
+                let down = spark.error.is_some() || !spark.up;
+                let text = if down {
+                    "down".to_string()
+                } else if spark.tok_s <= 0.0 {
+                    "idle".to_string()
+                } else {
+                    format!("{:.0} t/s", spark.tok_s)
+                };
+                render::Row {
+                    five: Some(spark.tok_s),
+                    week: None,
+                    fable: None,
+                    roll: None,
+                    stale: false,
+                    pace: [None; 3],
+                    projected: [None; 3],
+                    text: [Some(text), None, None],
+                    critical: [down, false, false],
+                }
+            });
             let model = render::Model {
                 rows,
                 hover: s.hover,
@@ -548,6 +599,16 @@ fn ensure_widget() {
                 hide_week: s.hide_week,
                 hide_fable: s.hide_fable,
                 rows_per_col: s.rows_per_col as usize,
+                provider_mark:0,
+                codex_rows,
+                spark_row,
+                show_claude:s.show_claude,
+                show_codex:s.show_codex,
+                show_spark:s.show_spark&&!s.spark_host.is_empty(),
+                spark_points:s.spark_history.iter().map(|x|x.1 as f32).collect(),
+                spark_busy:s.spark.as_ref().is_some_and(|x|x.busy),
+                spark_down:s.spark.as_ref().is_some_and(|x|x.error.is_some()||!x.up),
+                spark_pulse_alpha: spark_pulse_alpha(),
             };
             let changed = s.rendered.as_ref() != Some(&key);
             (key, changed, model)
@@ -559,7 +620,10 @@ fn ensure_widget() {
             w = frame.w;
             wh = frame.h;
             present(widget, &frame);
-            with(|s| s.rendered = Some(key));
+            with(|s| {
+                s.group_ranges = frame.groups.clone();
+                s.rendered = Some(key);
+            });
         }
 
         let gap = (2.0 * scale) as i32;
@@ -656,7 +720,7 @@ fn update_tooltip() {
 }
 
 fn tooltip_text(s: &State) -> String {
-    let mut out = String::from("Claude usage");
+    let mut out = String::from("Taskbar Usage Widget");
     let multi = s.accounts.len() > 1;
     let indent = if multi { "  " } else { "" };
     let line = |name: &str, l: Option<api::Limit>, with_day: bool| -> String {
@@ -685,7 +749,7 @@ fn tooltip_text(s: &State) -> String {
                 out += &format!(" (column {}, row {})", i / per + 1, i % per + 1);
             }
         }
-        let u = a.usage.unwrap_or_default();
+        let u = a.usage.clone().unwrap_or_default();
         if a.usage.is_some() {
             if u.has_five_hour {
                 out += &line("5-hour", u.five_hour, false);
@@ -694,6 +758,7 @@ fn tooltip_text(s: &State) -> String {
             if u.fable.is_some() {
                 out += &line("Fable (weekly)", u.fable, true);
             }
+            for e in &u.extra { out += &line(&e.label,Some(e.limit),true); }
         }
         if let Some(t) = a.last_ok {
             out += &format!("\n{indent}Updated {}", local_time(t, false));
@@ -704,6 +769,11 @@ fn tooltip_text(s: &State) -> String {
             out += &format!("\n{indent}Loading…");
         }
     }
+    if s.show_codex {
+        out += "\n\nCodex";
+        if let Some(c)=&s.codex { if let Some(p)=&c.plan_type{out+=&format!(" ({p})");} for w in &c.windows { let p=providers::pace(w.percent,w.resets_at,w.window_secs,now(),None); out+=&format!("\n{}: {:.0}% used - {}",w.label,w.percent,providers::forecast_wording(p,w.resets_at)); if let Some(r)=w.resets_at{out+=&format!(" - Resets in {}",providers::resets_in(r-now()));} if w.reset_since_last_run{out+=" (reset since last Codex run)";} } if now()-c.as_of>21600{out+="\n(stale)";} if let Some(e)=&c.error{out+=&format!("\n{e}");} } else {out+="\nLoading...";}
+    }
+    if s.show_spark&&!s.spark_host.is_empty(){out+="\n\nSpark";if let Some(sp)=&s.spark{if let Some(e)=&sp.error{out+=&format!("\nDown: {e}");}else{out+=&format!("\n{} - {:.0} t/s - GPU {:.0}%",if sp.busy{"Busy"}else{"Idle"},sp.tok_s,sp.gpu_util);}}else{out+="\nLoading...";}}
     out
 }
 
@@ -1036,119 +1106,119 @@ fn cswap_switch(exe: &Path) -> Result<(), String> {
     }
 }
 
-// ---------- updates ----------
-
-/// First check shortly after launch, then once a day.
-const UPDATE_FIRST_CHECK_MS: u32 = 15_000;
-const UPDATE_EVERY_MS: u32 = 24 * 60 * 60 * 1000;
-
-enum UpdateMsg {
-    Checked { manual: bool, r: Result<Option<update::Release>, String> },
-    Installed { rel: update::Release, r: Result<(), update::InstallError> },
+struct ProviderResult {
+    codex: providers::Reading,
+    codex_sig: Vec<(PathBuf, u64, i64)>,
+    codex_checked: bool,
+    spark: Option<providers::SparkSnapshot>,
 }
 
-fn post_update(ctl: isize, msg: UpdateMsg) {
-    unsafe { PostMessageW(ctl as HWND, WM_APP_UPDATE, 0, Box::into_raw(Box::new(msg)) as LPARAM) };
-}
-
-/// Looks for a newer release. `manual` (from the menu) also reports
-/// "up to date" and errors; the daily check stays quiet.
-fn start_update_check(manual: bool) {
-    let ctl = with(|s| {
-        if s.update_busy.is_some() {
-            return None;
-        }
-        s.update_busy = Some("Checking for updates…");
-        Some(s.ctl as isize)
+fn start_provider_fetch() {
+    let (ctl, host, fake, old_codex, old_sig, due) = with(|s| {
+        (
+            s.ctl as isize,
+            s.spark_host.clone(),
+            s.fake_data,
+            s.codex.clone(),
+            s.codex_sig.clone(),
+            now() - s.codex_checked_at >= 60,
+        )
     });
-    let Some(ctl) = ctl else { return };
-    std::thread::spawn(move || post_update(ctl, UpdateMsg::Checked { manual, r: update::check() }));
-}
-
-fn start_update_install() {
-    let job = with(|s| {
-        if s.update_busy.is_some() {
-            return None;
-        }
-        let rel = s.update.clone()?;
-        s.update_busy = Some("Updating…");
-        Some((s.ctl as isize, rel))
-    });
-    let Some((ctl, rel)) = job else { return };
     std::thread::spawn(move || {
-        let r = match std::env::current_exe() {
-            Ok(exe) => update::install(&rel, &exe),
-            Err(e) => Err(update::InstallError::Other(format!("Can't find the widget's exe: {e}"))),
+        let t = now();
+        let signature = providers::codex_files_signature();
+        let codex = if !due {
+            old_codex.unwrap_or_else(|| providers::read_codex(t))
+        } else if !fake && signature == old_sig && old_codex.is_some() {
+            old_codex.unwrap()
+        } else if fake {
+            providers::Reading { provider: providers::Provider::Codex, account: None, windows: vec![
+                providers::Window { key:"week".into(),label:"Weekly".into(),percent:37.0,resets_at:Some(t+4*86400),window_secs:Some(604800),reset_since_last_run:false },
+                providers::Window { key:"5h".into(),label:"5-hour".into(),percent:18.0,resets_at:Some(t+7200),window_secs:Some(18000),reset_since_last_run:false }], fetched_at:t, as_of:t, error:None, plan_type:Some("dev".into()) }
+        } else {
+            providers::read_codex(t)
         };
-        post_update(ctl, UpdateMsg::Installed { rel, r });
+        let spark = if host.is_empty() { None } else if fake {
+            Some(providers::parse_spark(&serde_json::json!({"endpoints":[{"name":"dev","model":"local","engine":"dev","up":true,"tok_s":142.0,"running":1}],"sys":{"gpu":{"util":72.0}}}),t))
+        } else { Some(providers::fetch_spark(&host,t)) };
+        let msg = Box::new(ProviderResult {
+            codex,
+            codex_sig: signature,
+            codex_checked: due,
+            spark,
+        });
+        unsafe { PostMessageW(ctl as HWND,WM_APP_PROVIDER,0,Box::into_raw(msg) as LPARAM); }
     });
 }
 
-unsafe fn on_update_msg(msg: UpdateMsg) {
-    let ctl = with(|s| {
-        s.update_busy = None;
-        s.ctl
-    });
-    match msg {
-        UpdateMsg::Checked { manual, r } => {
-            SetTimer(ctl, T_UPDATE, UPDATE_EVERY_MS, None);
-            let current = concat!("v", env!("CARGO_PKG_VERSION"));
-            match r {
-                Ok(Some(rel)) => {
-                    let tag = rel.tag.clone();
-                    with(|s| s.update = Some(rel));
-                    if manual {
-                        let text = format!(
-                            "Version {tag} is available (you have {current}).\n\nUpdate now? The widget restarts by itself."
-                        );
-                        if message(&text, MB_YESNO | MB_ICONINFORMATION) == IDYES {
-                            start_update_install();
-                        }
-                    }
-                }
-                Ok(None) => {
-                    with(|s| s.update = None);
-                    if manual {
-                        message(&format!("You have the latest version ({current})."), MB_OK | MB_ICONINFORMATION);
-                    }
-                }
-                Err(e) => {
-                    if manual {
-                        message(&format!("Couldn't check for updates:\n\n{e}"), MB_OK | MB_ICONWARNING);
-                    }
-                }
-            }
+fn claude_readings(s:&State,t:i64)->Vec<providers::Reading>{
+    s.accounts.iter().map(|a|{
+        let mut windows=Vec::new();
+        if let Some(u)=&a.usage {
+            if let Some(l)=u.five_hour { windows.push(providers::Window{key:"5h".into(),label:"5-hour".into(),percent:l.percent,resets_at:l.resets_at,window_secs:Some(18000),reset_since_last_run:false}); }
+            if let Some(l)=u.weekly { windows.push(providers::Window{key:"week".into(),label:"Weekly".into(),percent:l.percent,resets_at:l.resets_at,window_secs:Some(604800),reset_since_last_run:false}); }
+            for e in &u.extra { windows.push(providers::Window{key:e.key.clone(),label:e.label.clone(),percent:e.limit.percent,resets_at:e.limit.resets_at,window_secs:Some(e.window_secs),reset_since_last_run:false}); }
         }
-        UpdateMsg::Installed { rel, r } => match r {
-            Ok(()) => {
-                let exe = std::env::current_exe().unwrap_or_default();
-                if let Err(e) = std::process::Command::new(&exe).arg(update::UPDATED_ARG).spawn() {
-                    message(
-                        &format!("{} was installed but couldn't be started:\n\n{e}\n\nStart the widget again by hand.", rel.tag),
-                        MB_OK | MB_ICONWARNING,
-                    );
-                }
-                quit();
-            }
-            Err(update::InstallError::NoAccess) => {
-                let folder = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.display().to_string()))
-                    .unwrap_or_default();
-                message(
-                    &format!(
-                        "The widget can't update itself in\n{folder}\nbecause that folder needs administrator rights.\n\n\
-                         The download page will open so you can replace the exe by hand. Keeping the widget in a folder \
-                         of your own, like %LOCALAPPDATA%\\Programs\\ClaudeUsageWidget, lets it update itself."
-                    ),
-                    MB_OK | MB_ICONINFORMATION,
-                );
-                open_url(&rel.page);
-            }
-            Err(update::InstallError::Other(e)) => {
-                message(&format!("Updating to {} failed:\n\n{e}", rel.tag), MB_OK | MB_ICONWARNING);
-            }
-        },
+        providers::Reading{provider:providers::Provider::Claude,account:Some(a.label.clone()),windows,fetched_at:a.last_ok.unwrap_or(t),as_of:a.last_ok.unwrap_or(t),error:a.error.clone(),plan_type:None}
+    }).collect()
+}
+
+fn persist_state(s:&mut State,t:i64){
+    let mut readings=claude_readings(s,t);
+    if let Some(c)=&s.codex { readings.push(c.clone()); }
+    if let Some(history) = &mut s.history {
+        let _ = history.append(&readings, s.spark.as_ref(), t);
+        let _ = storage::write_state(&readings, s.spark.as_ref(), history, t);
+    }
+}
+
+fn on_provider_result(r:ProviderResult){
+    with(|s|{
+        s.codex=Some(r.codex); s.codex_sig=r.codex_sig; if r.codex_checked{s.codex_checked_at=now();} s.spark=r.spark;
+        if let Some(sp)=&s.spark { s.spark_history.push((sp.fetched_at,sp.tok_s,sp.gpu_util)); }
+        let cutoff=now()-600; s.spark_history.retain(|x|x.0>=cutoff);
+        persist_state(s,now()); s.rendered=None;
+    });
+    unsafe {
+        let (ctl, busy) = with(|s| (s.ctl, s.spark.as_ref().is_some_and(|spark| spark.busy)));
+        if busy {
+            SetTimer(ctl, T_SPARK_PULSE, 100, None);
+        } else {
+            KillTimer(ctl, T_SPARK_PULSE);
+        }
+    }
+    ensure_widget(); update_tooltip();
+}
+
+fn spark_pulse_alpha() -> f32 {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f32();
+    0.72 + 0.28 * (seconds * std::f32::consts::TAU).sin()
+}
+
+fn provider_poll_ms() -> u32 {
+    unsafe {
+        let desktop = windows_sys::Win32::System::StationsAndDesktops::OpenInputDesktop(
+            0,
+            0,
+            windows_sys::Win32::System::StationsAndDesktops::DESKTOP_SWITCHDESKTOP,
+        );
+        let locked = desktop.is_null()
+            || windows_sys::Win32::System::StationsAndDesktops::SwitchDesktop(desktop) == 0;
+        if !desktop.is_null() {
+            windows_sys::Win32::System::StationsAndDesktops::CloseDesktop(desktop);
+        }
+        let mut input = windows_sys::Win32::UI::Input::KeyboardAndMouse::LASTINPUTINFO {
+            cbSize: std::mem::size_of::<windows_sys::Win32::UI::Input::KeyboardAndMouse::LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        let idle = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetLastInputInfo(&mut input) != 0
+            && windows_sys::Win32::System::SystemInformation::GetTickCount()
+                .wrapping_sub(input.dwTime)
+                >= 10 * 60 * 1000;
+        if locked || idle { 30_000 } else { 5_000 }
     }
 }
 
@@ -1181,6 +1251,31 @@ fn open_url(url: &str) {
     unsafe {
         ShellExecuteW(null_mut(), w!("open"), wide(url).as_ptr(), null(), null(), SW_SHOWNORMAL);
     }
+}
+
+thread_local! { static SPARK_DIALOG: RefCell<(String,Option<String>)> = const { RefCell::new((String::new(),None)) }; }
+
+unsafe extern "system" fn spark_dialog_proc(hwnd:HWND,msg:u32,wp:WPARAM,_:LPARAM)->isize{
+    match msg {
+        WM_INITDIALOG=>{let text=SPARK_DIALOG.with(|x|x.borrow().0.clone());SetDlgItemTextW(hwnd,100,wide(&text).as_ptr());1}
+        WM_COMMAND if (wp&0xffff)as usize==IDOK as usize=>{let mut b=[0u16;512];let n=GetDlgItemTextW(hwnd,100,b.as_mut_ptr(),b.len()as i32);let s=String::from_utf16_lossy(&b[..n as usize]).trim().trim_start_matches("http://").trim_end_matches('/').to_string();SPARK_DIALOG.with(|x|x.borrow_mut().1=Some(s));EndDialog(hwnd,IDOK as isize);1}
+        WM_COMMAND if (wp&0xffff)as usize==IDCANCEL as usize=>{EndDialog(hwnd,IDCANCEL as isize);1}
+        WM_CLOSE=>{EndDialog(hwnd,IDCANCEL as isize);1}
+        _=>0
+    }
+}
+
+fn prompt_spark_address()->Option<String>{
+    let current=with(|s|s.spark_host.clone()); SPARK_DIALOG.with(|x|*x.borrow_mut()=(current,None));
+    let mut v=Vec::<u16>::new(); let d=|v:&mut Vec<u16>,x:u32|{v.push(x as u16);v.push((x>>16)as u16)}; let z=|v:&mut Vec<u16>,s:&str|{v.extend(s.encode_utf16());v.push(0)};
+    d(&mut v,(WS_POPUP|WS_CAPTION|WS_SYSMENU)as u32|DS_MODALFRAME as u32);d(&mut v,0);v.extend([4,10,10,210,70]);v.extend([0,0]);z(&mut v,"Spark address");
+    let item=|v:&mut Vec<u16>,style:u32,x:u16,y:u16,cx:u16,cy:u16,id:u16,class:u16,title:&str|{if v.len()%2!=0{v.push(0)}d(v,style);d(v,0);v.extend([x,y,cx,cy,id,0xffff,class]);z(v,title);v.push(0)};
+    item(&mut v,(WS_CHILD|WS_VISIBLE)as u32,8,8,194,10,101,0x0082,"Host or host:port");
+    item(&mut v,(WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP)as u32|ES_AUTOHSCROLL as u32,8,21,194,14,100,0x0081,"");
+    item(&mut v,(WS_CHILD|WS_VISIBLE|WS_TABSTOP)as u32|BS_DEFPUSHBUTTON as u32,92,45,52,14,IDOK as u16,0x0080,"OK");
+    item(&mut v,(WS_CHILD|WS_VISIBLE|WS_TABSTOP)as u32,150,45,52,14,IDCANCEL as u16,0x0080,"Cancel");
+    unsafe{DialogBoxIndirectParamW(GetModuleHandleW(null()),v.as_ptr()as*const DLGTEMPLATE,with(|s|s.ctl),Some(spark_dialog_proc),0);}
+    SPARK_DIALOG.with(|x|x.borrow_mut().1.take())
 }
 
 /// A small yellow dot next to the item (a native menu can show an icon but not a coloured label).
@@ -1295,6 +1390,11 @@ unsafe fn show_menu() {
     for (i, (_, label)) in INTERVALS.iter().enumerate() {
         AppendMenuW(sub, tick(ID_INTERVAL_BASE + i), ID_INTERVAL_BASE + i, wide(label).as_ptr());
     }
+    AppendMenuW(menu, tick(ID_SHOW_CLAUDE), ID_SHOW_CLAUDE, w!("Show Claude"));
+    AppendMenuW(menu, tick(ID_SHOW_CODEX), ID_SHOW_CODEX, w!("Show Codex"));
+    AppendMenuW(menu, tick(ID_SHOW_SPARK), ID_SHOW_SPARK, w!("Show Spark"));
+    AppendMenuW(menu, MF_STRING, ID_SPARK_ADDRESS, w!("Spark address..."));
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_POPUP, sub as usize, w!("Update every"));
     AppendMenuW(menu, tick(ID_SHOW_LEFT), ID_SHOW_LEFT, w!("Show remaining instead of used"));
     let custom = CreatePopupMenu();
@@ -1380,14 +1480,6 @@ unsafe fn show_menu() {
         };
         AppendMenuW(menu, flags, ID_CSWAP, text);
     }
-    let (busy, new_tag) = with(|s| (s.update_busy, s.update.as_ref().map(|r| r.tag.clone())));
-    let update_text = match (busy, &new_tag) {
-        (Some(b), _) => b.to_string(),
-        (None, Some(tag)) => format!("Update to {tag}"),
-        (None, None) => "Check for updates".to_string(),
-    };
-    let update_flags = if busy.is_some() { MF_STRING | MF_GRAYED } else { MF_STRING };
-    AppendMenuW(menu, update_flags, ID_UPDATE, wide(&update_text).as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
     refresh_menu(menu);
@@ -1408,7 +1500,10 @@ unsafe fn show_menu() {
         return;
     }
     match cmd as usize {
-        ID_REFRESH => start_fetch_all(),
+        ID_REFRESH => { start_fetch_all(); start_provider_fetch(); },
+        ID_SPARK_ADDRESS => {
+            if let Some(host)=prompt_spark_address(){ with(|s|{s.spark_host=host.clone();s.rendered=None;}); write_string_setting("SparkHost",&host); start_provider_fetch(); }
+        }
         ID_ADD_ACCOUNT => add_account(),
         id if (ID_REMOVE_BASE..ID_REMOVE_BASE + labels.len()).contains(&id) => {
             remove_account(id - ID_REMOVE_BASE);
@@ -1417,13 +1512,6 @@ unsafe fn show_menu() {
         ID_CSWAP => {
             if let Some(exe) = cswap {
                 run_cswap_switch(exe);
-            }
-        }
-        ID_UPDATE => {
-            if new_tag.is_some() {
-                start_update_install();
-            } else {
-                start_update_check(true);
             }
         }
         ID_EXIT => quit(),
@@ -1444,6 +1532,9 @@ fn setting_checked(id: usize) -> Option<bool> {
     with(|s| {
         Some(match id {
             ID_SHOW_LEFT => s.show_left,
+            ID_SHOW_CLAUDE => s.show_claude,
+            ID_SHOW_CODEX => s.show_codex,
+            ID_SHOW_SPARK => s.show_spark,
             ID_RINGS => s.rings,
             ID_RING_TEXT => s.ring_text,
             ID_RING_COLOR_ONLY => s.ring_color_only,
@@ -1483,6 +1574,10 @@ fn setting_checked(id: usize) -> Option<bool> {
 /// Applies a setting picked in the menu. Returns false for other items.
 fn apply_setting(id: usize) -> bool {
     match id {
+        ID_SHOW_CLAUDE | ID_SHOW_CODEX | ID_SHOW_SPARK => {
+            let (name,on)=with(|s|match id {ID_SHOW_CLAUDE=>{s.show_claude=!s.show_claude;("ShowClaude",s.show_claude)},ID_SHOW_CODEX=>{s.show_codex=!s.show_codex;("ShowCodex",s.show_codex)},_=>{s.show_spark=!s.show_spark;("ShowSpark",s.show_spark)}});
+            write_setting(name,on as u32); ensure_widget();
+        }
         ID_AUTOSTART => set_autostart(!autostart_enabled()),
         ID_SHOW_LEFT => {
             let on = with(|s| {
@@ -1710,7 +1805,7 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 T_ROLL => {
                     let rolling = with(|s| {
                         for a in &mut s.accounts {
-                            a.prev = a.prev.filter(|(_, at)| at.elapsed().as_secs_f32() < ROLL_SECS);
+                            a.prev = a.prev.take().filter(|(_, at)| at.elapsed().as_secs_f32() < ROLL_SECS);
                         }
                         s.accounts.iter().any(|a| a.prev.is_some())
                     });
@@ -1719,9 +1814,18 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     }
                     ensure_widget(); // the next frame, or the settled numbers
                 }
-                T_UPDATE => {
-                    KillTimer(hwnd, T_UPDATE);
-                    start_update_check(false);
+                T_PROVIDER => {
+                    start_provider_fetch();
+                    SetTimer(hwnd, T_PROVIDER, provider_poll_ms(), None);
+                }
+                T_SPARK_PULSE => {
+                    let busy = with(|s| s.spark.as_ref().is_some_and(|spark| spark.busy));
+                    if busy {
+                        with(|s| s.rendered = None);
+                        ensure_widget();
+                    } else {
+                        KillTimer(hwnd, T_SPARK_PULSE);
+                    }
                 }
                 T_TICK => {
                     update_tooltip();
@@ -1735,7 +1839,7 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                                 if a.error.is_some() {
                                     return false;
                                 }
-                                let u = a.usage.unwrap_or_default();
+                                let u = a.usage.clone().unwrap_or_default();
                                 [u.five_hour, u.weekly, u.fable].iter().flatten().any(|l| {
                                     l.resets_at
                                         .is_some_and(|t| t < now() && a.last_ok.is_some_and(|ok| ok < t))
@@ -1763,14 +1867,14 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             0
         }
-        WM_APP_UPDATE => {
-            let m = Box::from_raw(lp as *mut UpdateMsg);
-            on_update_msg(*m);
-            0
-        }
         WM_APP_CSWAP => {
             let r = Box::from_raw(lp as *mut Result<(), String>);
             on_cswap_done(*r);
+            0
+        }
+        WM_APP_PROVIDER => {
+            let r = Box::from_raw(lp as *mut ProviderResult);
+            on_provider_result(*r);
             0
         }
         WM_APP_RESULT => {
@@ -1827,7 +1931,23 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             0
         }
         WM_LBUTTONUP => {
-            open_usage_page();
+            let x=(lp as i16) as i32;
+            let (group, host) = with(|s| {
+                (
+                    s.group_ranges
+                        .iter()
+                        .find(|range| x >= range.x0 && x < range.x1)
+                        .map(|range| range.group),
+                    s.spark_host.clone(),
+                )
+            });
+            match group {
+                Some(render::Group::Codex) => {
+                    open_url("https://chatgpt.com/codex/settings/usage")
+                }
+                Some(render::Group::Spark) => open_url(&format!("http://{host}/")),
+                Some(render::Group::Claude) | None => open_usage_page(),
+            }
             0
         }
         WM_RBUTTONUP => {

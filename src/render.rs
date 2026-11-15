@@ -54,6 +54,7 @@ const RING_BLUE: Rgba = Rgba(0.298, 0.608, 0.961, 1.0); // #4C9BF5
 pub const CLAUDE_ORANGE: Rgba = Rgba(0.851, 0.467, 0.341, 1.0); // #D97757
 
 /// One account's numbers.
+#[derive(Clone)]
 pub struct Row {
     pub five: Option<f64>,
     pub week: Option<f64>,
@@ -62,6 +63,11 @@ pub struct Row {
     /// A change being animated: the values before it (5h, week, Fable) and progress 0 to 1.
     pub roll: Option<([Option<f64>; 3], f32)>,
     pub stale: bool,
+    /// Elapsed fraction marker and projected percent for 5h/week/Fable.
+    pub pace: [Option<f32>; 3],
+    pub projected: [Option<f32>; 3],
+    pub text: [Option<String>; 3],
+    pub critical: [bool; 3],
 }
 
 /// Most accounts that fit in one column.
@@ -69,6 +75,7 @@ pub const MAX_ROWS_PER_COLUMN: usize = 3;
 /// The "Default" font size; other sizes scale relative to it.
 pub const DEFAULT_FONT_SIZE: u32 = 14;
 
+#[derive(Clone)]
 pub struct Model {
     /// One per account, laid out top to bottom, then left to right.
     pub rows: Vec<Row>,
@@ -104,18 +111,43 @@ pub struct Model {
     pub hide_fable: bool,
     /// Accounts stacked per column (1 to MAX_ROWS_PER_COLUMN); more start a new column.
     pub rows_per_col: usize,
+    pub provider_mark: u8, // 0 Claude, 1 Codex, 2 Spark
+    pub codex_rows: Vec<Row>,
+    pub spark_row: Option<Row>,
+    pub show_claude: bool,
+    pub show_codex: bool,
+    pub show_spark: bool,
+    pub spark_points: Vec<f32>,
+    pub spark_busy: bool,
+    pub spark_down: bool,
+    pub spark_pulse_alpha: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Claude,
+    Codex,
+    Spark,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GroupRange {
+    pub group: Group,
+    pub x0: i32,
+    pub x1: i32,
 }
 
 pub struct Frame {
     pub w: i32,
     pub h: i32,
     pub px: Vec<[u8; 4]>, // premultiplied B, G, R, A
+    pub groups: Vec<GroupRange>,
 }
 
 fn value_text(v: Option<f64>, show_left: bool, hide_percent: bool) -> String {
     match v {
         Some(p) => {
-            let used = p.round().clamp(0.0, 100.0) as i64;
+            let used = if hide_percent && !show_left { p.round().max(0.0) as i64 } else { p.round().clamp(0.0, 100.0) as i64 };
             let n = if show_left { 100 - used } else { used };
             if hide_percent { n.to_string() } else { format!("{n}%") }
         }
@@ -183,6 +215,7 @@ struct Ring {
     /// Filled part, 0 to 1, clockwise from the top.
     frac: f32,
     color: Rgba,
+    pace: Option<f32>,
 }
 
 struct Divider {
@@ -196,6 +229,258 @@ struct Divider {
 /// `vert = Some(width)` for a vertical taskbar: one line per limit, stacked under
 /// the icon, shrunk until it fits that width.
 pub fn render(m: &Model, h: i32, scale: f32, vert: Option<i32>) -> Frame {
+    let mut frames = Vec::new();
+    if m.show_claude {
+        let mut model = m.clone();
+        model.codex_rows.clear();
+        model.spark_row = None;
+        frames.push((Group::Claude, render_one(&model, h, scale, vert)));
+    }
+    if m.show_codex {
+        let mut model = m.clone();
+        model.rows = model.codex_rows.clone();
+        model.codex_rows.clear();
+        model.spark_row = None;
+        model.provider_mark = 1;
+        model.hide_fable = true;
+        model.hide_five = !model.rows.iter().any(|row| row.five.is_some());
+        model.rows_per_col = 1;
+        frames.push((Group::Codex, render_one(&model, h, scale, vert)));
+    }
+    if m.show_spark {
+        if let Some(row) = m.spark_row.clone() {
+            let mut model = m.clone();
+            model.rows = vec![row];
+            model.codex_rows.clear();
+            model.spark_row = None;
+            model.provider_mark = 2;
+            model.hide_five = false;
+            model.hide_week = true;
+            model.hide_fable = true;
+            model.hide_labels = true;
+            model.hide_percent = true;
+            model.show_left = false;
+            model.rings = false;
+            model.rows_per_col = 1;
+            let mut frame = render_one(&model, h, scale, vert);
+            decorate_spark(
+                &mut frame,
+                &m.spark_points,
+                m.spark_busy,
+                m.spark_down,
+                m.spark_pulse_alpha,
+                scale,
+            );
+            frames.push((Group::Spark, frame));
+        }
+    }
+    if frames.is_empty() {
+        return Frame {
+            w: 1,
+            h: h.max(1),
+            px: vec![[0, 0, 0, 1]; h.max(1) as usize],
+            groups: Vec::new(),
+        };
+    }
+    combine(frames, vert.is_some(), m.dark, scale)
+}
+
+struct Bar {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    frac: f32,
+    pace: Option<f32>,
+    color: Rgba,
+}
+
+fn decorate_spark(f: &mut Frame, points: &[f32], busy: bool, down: bool, pulse: f32, scale: f32) {
+    let add = (44.0 * scale).round() as i32;
+    let old = f.w;
+    let mut px = vec![[0, 0, 0, 1]; ((old + add) * f.h) as usize];
+    for y in 0..f.h {
+        for x in 0..old {
+            px[(y * (old + add) + x) as usize] = f.px[(y * old + x) as usize];
+        }
+    }
+    let alpha = if busy { pulse.clamp(0.45, 1.0) } else { 1.0 };
+    let color = if down { [28, 43, 196] } else { [0, 185, 118] };
+    let dot = [
+        (color[0] as f32 * alpha) as u8,
+        (color[1] as f32 * alpha) as u8,
+        (color[2] as f32 * alpha) as u8,
+        (255.0 * alpha) as u8,
+    ];
+    let cy = f.h / 2;
+    for y in cy - 3..=cy + 3 {
+        for x in old + 3..old + 9 {
+            if (x - (old + 6)).pow(2) + (y - cy).pow(2) <= 9 {
+                px[(y * (old + add) + x) as usize] = dot;
+            }
+        }
+    }
+    if !points.is_empty() {
+        let green = [0, 185, 118]; // premultiplied as BGRA by blend_pixel
+        let peak = points.iter().copied().fold(1.0f32, f32::max);
+        let x0 = old + 12;
+        let graph_width = (add - 15).max(1);
+        let baseline = f.h - 4;
+        let graph_height = (f.h - 8).max(1) as f32;
+        let sample = |position: f32| {
+            let last = points.len().saturating_sub(1);
+            let index = position.floor() as usize;
+            let t = position - index as f32;
+            let p0 = points[index.saturating_sub(1).min(last)];
+            let p1 = points[index.min(last)];
+            let p2 = points[(index + 1).min(last)];
+            let p3 = points[(index + 2).min(last)];
+            let t2 = t * t;
+            let t3 = t2 * t;
+            (0.5
+                * ((2.0 * p1)
+                    + (-p0 + p2) * t
+                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3))
+                .clamp(0.0, peak)
+        };
+        let mut curve = Vec::with_capacity((graph_width + 1) as usize);
+        for dx in 0..=graph_width {
+            let position = if points.len() == 1 {
+                0.0
+            } else {
+                dx as f32 * (points.len() - 1) as f32 / graph_width as f32
+            };
+            let value = sample(position);
+            curve.push(baseline as f32 - value / peak * graph_height);
+        }
+
+        // Soft area fill, strongest at the curve and fading toward the baseline.
+        for (dx, curve_y) in curve.iter().copied().enumerate() {
+            let x = x0 + dx as i32;
+            let top = curve_y.ceil() as i32;
+            let depth = (baseline - top).max(1) as f32;
+            for y in top..=baseline {
+                let fade = 1.0 - (y - top) as f32 / depth;
+                blend_pixel(
+                    &mut px[(y * (old + add) + x) as usize],
+                    green,
+                    0.025 + 0.15 * fade,
+                );
+            }
+        }
+
+        // Smooth 1.5 px stroke at 100% scale.
+        let radius = (0.75 * scale).max(0.75);
+        for (dx, curve_y) in curve.iter().copied().enumerate() {
+            let x = x0 + dx as i32;
+            let extent = (radius + 1.0).ceil() as i32;
+            for y in curve_y.round() as i32 - extent..=curve_y.round() as i32 + extent {
+                if y >= 0 && y < f.h && x >= 0 && x < old + add {
+                    let coverage = (radius + 0.5 - (y as f32 + 0.5 - curve_y).abs())
+                        .clamp(0.0, 1.0);
+                    blend_pixel(
+                        &mut px[(y * (old + add) + x) as usize],
+                        green,
+                        coverage,
+                    );
+                }
+            }
+        }
+
+        // Emphasize the newest sample.
+        let last_x = x0 + graph_width;
+        let last_y = *curve.last().unwrap_or(&(baseline as f32));
+        let dot_radius = (1.8 * scale).max(1.5);
+        let extent = dot_radius.ceil() as i32;
+        for y in last_y.round() as i32 - extent..=last_y.round() as i32 + extent {
+            for x in last_x - extent..=last_x + extent {
+                if y >= 0 && y < f.h && x >= 0 && x < old + add {
+                    let dx = x as f32 + 0.5 - last_x as f32;
+                    let dy = y as f32 + 0.5 - last_y;
+                    let coverage = (dot_radius + 0.5 - (dx * dx + dy * dy).sqrt())
+                        .clamp(0.0, 1.0);
+                    blend_pixel(
+                        &mut px[(y * (old + add) + x) as usize],
+                        green,
+                        coverage,
+                    );
+                }
+            }
+        }
+    }
+    f.w = old + add;
+    f.px = px;
+}
+
+fn blend_pixel(pixel: &mut [u8; 4], color: [u8; 3], alpha: f32) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let keep = 1.0 - alpha;
+    for channel in 0..3 {
+        pixel[channel] = (color[channel] as f32 * alpha + pixel[channel] as f32 * keep) as u8;
+    }
+    pixel[3] = (255.0 * alpha + pixel[3] as f32 * keep) as u8;
+}
+
+fn combine(frames: Vec<(Group, Frame)>, vertical: bool, dark: bool, scale: f32) -> Frame {
+    let gap = scale.round().max(1.0) as i32;
+    let divider = palette(dark).divider;
+    let alpha = divider.3;
+    let divider_px = [
+        (divider.2 * alpha * 255.0) as u8,
+        (divider.1 * alpha * 255.0) as u8,
+        (divider.0 * alpha * 255.0) as u8,
+        (alpha * 255.0) as u8,
+    ];
+    let w = if vertical {
+        frames.iter().map(|(_, frame)| frame.w).max().unwrap_or(1)
+    } else {
+        frames.iter().map(|(_, frame)| frame.w).sum::<i32>()
+            + gap * (frames.len() as i32 - 1)
+    };
+    let h = if vertical {
+        frames.iter().map(|(_, frame)| frame.h).sum::<i32>()
+            + gap * (frames.len() as i32 - 1)
+    } else {
+        frames.iter().map(|(_, frame)| frame.h).max().unwrap_or(1)
+    };
+    let mut px = vec![[0, 0, 0, 1]; (w * h) as usize];
+    let (mut ox, mut oy) = (0, 0);
+    let mut groups = Vec::new();
+    let divider_len = (20.0 * scale).round() as i32;
+    for (i, (group, frame)) in frames.iter().enumerate() {
+        for y in 0..frame.h {
+            for x in 0..frame.w {
+                px[((oy + y) * w + ox + x) as usize] = frame.px[(y * frame.w + x) as usize];
+            }
+        }
+        groups.push(GroupRange {
+            group: *group,
+            x0: ox,
+            x1: ox + frame.w,
+        });
+        if i + 1 < frames.len() {
+            if vertical {
+                let x0 = ((w - divider_len) / 2).max(0);
+                let x1 = (x0 + divider_len).min(w);
+                for x in x0..x1 {
+                    px[((oy + frame.h) * w + x) as usize] = divider_px;
+                }
+                oy += frame.h + gap;
+            } else {
+                let y0 = ((h - divider_len) / 2).max(0);
+                let y1 = (y0 + divider_len).min(h);
+                for y in y0..y1 {
+                    px[(y * w + ox + frame.w) as usize] = divider_px;
+                }
+                ox += frame.w + gap;
+            }
+        }
+    }
+    Frame { w, h, px, groups }
+}
+
+fn render_one(m: &Model, h: i32, scale: f32, vert: Option<i32>) -> Frame {
     let Some(avail) = vert else { return layout(m, h, scale, false) };
     let mut k = 1.0;
     loop {
@@ -213,7 +498,17 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
     let s = |v: f32| (v * scale).round() as i32;
     // Vertical lines are sized as on a 32 px tall taskbar.
     let mut h = if vertical { s(32.0) } else { h };
-    let empty = [Row { five: None, week: None, fable: None, roll: None, stale: false }];
+    let empty = [Row {
+        five: None,
+        week: None,
+        fable: None,
+        roll: None,
+        stale: false,
+        pace: [None; 3],
+        projected: [None; 3],
+        text: [None, None, None],
+        critical: [false; 3],
+    }];
     let rows: &[Row] = if m.rows.is_empty() { &empty } else { &m.rows };
     // Vertical: every account in one column, one line per limit.
     let rows_per_col = if vertical { rows.len() } else { m.rows_per_col.clamp(1, MAX_ROWS_PER_COLUMN) };
@@ -311,6 +606,7 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         let mut segs = Vec::new();
         let mut dividers = Vec::new();
         let mut rings = Vec::new();
+        let mut bars = Vec::new();
         let enc = |t: &str| -> Vec<u16> { t.encode_utf16().collect() };
         let columns: Vec<&[Row]> = rows.chunks(rows_per_col).collect();
         for (ci, col) in columns.iter().enumerate() {
@@ -330,12 +626,32 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                 .collect();
             let values: Vec<Vec<Vec<u16>>> = col
                 .iter()
-                .map(|r| ids.iter().map(|&k| enc(&value_text([r.five, r.week, r.fable][k], m.show_left, m.hide_percent))).collect())
+                .map(|r| {
+                    ids.iter()
+                        .map(|&k| {
+                            r.text[k].as_ref().map_or_else(
+                                || {
+                                    enc(&value_text(
+                                        [r.five, r.week, r.fable][k],
+                                        m.show_left,
+                                        m.hide_percent,
+                                    ))
+                                },
+                                |text| enc(text),
+                            )
+                        })
+                        .collect()
+                })
                 .collect();
             let mut value_w = vec![0; groups];
             for v in &values {
                 for g in 0..groups {
                     value_w[g] = value_w[g].max(measure(&v[g], if inside { f_small } else { f_value }));
+                }
+            }
+            if !m.rings && m.provider_mark != 2 {
+                for width in &mut value_w {
+                    *width = (*width).max(s(28.0));
                 }
             }
             let mut group_x = vec![pad_l; groups];
@@ -384,7 +700,13 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                         dividers.push(Divider { x0: div_x[g], x1: div_x[g] + div_w, y0: dy.max(0), y1: (dy + div_h).min(h) });
                     }
                     let content_x = group_x[g] + label_w[g] + gap_lv;
-                    let color = value_color(val, &pal);
+                    let pi = ids[g];
+                    let color = match (val, row.pace[pi], row.projected[pi]) {
+                        _ if row.critical[pi] => pal.crit,
+                        (Some(_),_,Some(p)) if p>=100.0 => pal.crit,
+                        (Some(v),Some(e),_) if v>=50.0 && v>e as f64*100.0+10.0 => pal.warn,
+                        _ => value_color(val,&pal),
+                    };
                     if m.rings {
                         // The ring shows the same quantity as the number.
                         let frac = |v: Option<f64>| {
@@ -397,6 +719,7 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                             y: y0 + ((y1 - y0) - ring_d) / 2,
                             frac: row.roll.map_or(to, |(from, _)| frac(from[ids[g]]) + (to - frac(from[ids[g]])) * p),
                             color: dim(row.stale, if color == pal.value { RING_BLUE } else { color }),
+                            pace: row.pace[ids[g]],
                         });
                     }
                     let vf = if inside { f_small } else { f_value };
@@ -408,6 +731,20 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                             content_x + ring_d + ring_gap
                         }
                     };
+                    if !m.rings && m.provider_mark != 2 {
+                        bars.push(Bar {
+                            x: text_x(&vals[g]),
+                            y: y1 - s(5.0),
+                            w: value_w[g],
+                            h: s(2.0).max(1),
+                            frac: val.unwrap_or(0.0).clamp(0.0, 100.0) as f32 / 100.0,
+                            pace: row.pace[pi],
+                            color: dim(
+                                row.stale,
+                                if color == pal.value { RING_BLUE } else { color },
+                            ),
+                        });
+                    }
                     let color = dim(row.stale, if m.rings && m.ring_color_only { pal.value } else { color });
                     let old = row
                         .roll
@@ -556,6 +893,38 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
             }
         }
 
+        // Number-mode pace bars: usage fill plus a bright elapsed-time marker.
+        for bar in &bars {
+            let radius = bar.h as f32 / 2.0;
+            let fill_right = bar.x as f32 + bar.w as f32 * bar.frac;
+            for y in bar.y..bar.y + bar.h {
+                for x in bar.x..bar.x + bar.w {
+                    let coverage = rounded_rect_cov(
+                        x as f32 + 0.5,
+                        y as f32 + 0.5,
+                        bar.x as f32,
+                        bar.y as f32,
+                        (bar.x + bar.w) as f32,
+                        (bar.y + bar.h) as f32,
+                        radius,
+                    );
+                    let index = (y * w + x) as usize;
+                    over(&mut buf, index, pal.divider, coverage);
+                    if x as f32 + 0.5 <= fill_right {
+                        over(&mut buf, index, bar.color, coverage);
+                    }
+                }
+            }
+            if let Some(pace) = bar.pace {
+                let tick_x = bar.x + (pace.clamp(0.0, 1.0) * (bar.w - 1) as f32).round() as i32;
+                for y in bar.y - 1..bar.y + bar.h + 1 {
+                    if y >= 0 && y < h {
+                        over(&mut buf, (y * w + tick_x) as usize, pal.value, 1.0);
+                    }
+                }
+            }
+        }
+
         // Usage rings: a faint track, then the filled arc clockwise from the top.
         let rad = ring_d as f32 / 2.0;
         let stroke = (ring_d as f32 * 0.1).max(1.5);
@@ -582,15 +951,17 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                     over(&mut buf, i as usize, r.color, band * arc);
                 }
             }
+            if let Some(p)=r.pace { let a=p.clamp(0.0,1.0)*std::f32::consts::TAU; let (sn,cs)=a.sin_cos(); for q in 0..stroke.ceil() as i32+2 { let rr=rad-q as f32; let xx=(r.x as f32+rad+sn*rr).round()as i32; let yy=(r.y as f32+rad-cs*rr).round()as i32; if xx>=0&&xx<w&&yy>=0&&yy<h{over(&mut buf,(yy*w+xx)as usize,pal.label,1.0);} } }
         }
 
-        // Claude mark.
+        // Provider mark.
         let iy = if vertical { pad_v } else { (h - icon) / 2 };
-        let mark = if m.pixel_icon { draw_pixel_mark(icon) } else { draw_mark(icon) };
+        let mark = match m.provider_mark { 1=>draw_codex_mark(icon),2=>draw_spark_mark(icon),_ if m.pixel_icon=>draw_pixel_mark(icon),_=>draw_mark(icon) };
+        let mark_color=match m.provider_mark{2=>Rgba(0.463,0.725,0.0,1.0),1=>RING_BLUE,_=>CLAUDE_ORANGE};
         for y in 0..icon {
             for xx in 0..icon {
                 let cov = mark[(y * icon + xx) as usize];
-                over(&mut buf, ((iy + y) * w + icon_x + xx) as usize, dim(all_stale, CLAUDE_ORANGE), cov);
+                over(&mut buf, ((iy + y) * w + icon_x + xx) as usize, dim(all_stale, mark_color), cov);
             }
         }
 
@@ -634,8 +1005,50 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                 }
             })
             .collect();
-        Frame { w, h, px }
+        Frame { w, h, px, groups: Vec::new() }
     }
+}
+
+fn draw_codex_mark(size:i32)->Vec<f32>{ let mut o=vec![0.0;(size*size)as usize];let c=(size-1)as f32/2.0;let r=c*0.82;for y in 0..size{for x in 0..size{let dx=x as f32-c;let dy=y as f32-c;let a=dy.atan2(dx);let hex=r*(std::f32::consts::PI/6.0).cos()/((a.rem_euclid(std::f32::consts::PI/3.0)-std::f32::consts::PI/6.0).cos());let d=(dx*dx+dy*dy).sqrt();if(d-hex).abs()<1.4||(d<r*0.48&&((dx+dy).abs()<1.2||(dx-dy).abs()<1.2)){o[(y*size+x)as usize]=1.0}}}o}
+fn draw_spark_mark(size: i32) -> Vec<f32> {
+    let mut out = vec![0.0; (size * size) as usize];
+    let n = size as f32;
+    let (left, top, right, bottom) = (n * 0.22, n * 0.22, n * 0.78, n * 0.78);
+    let radius = n * 0.11;
+    let stroke = (n * 0.085).max(1.0);
+    let pin_half = (n * 0.045).max(0.7);
+    let pin_length = n * 0.16;
+    for y in 0..size {
+        for x in 0..size {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let outer = rounded_rect_cov(px, py, left, top, right, bottom, radius);
+            let inner = rounded_rect_cov(
+                px,
+                py,
+                left + stroke,
+                top + stroke,
+                right - stroke,
+                bottom - stroke,
+                (radius - stroke).max(0.0),
+            );
+            let mut coverage = (outer - inner).max(0.0);
+            for position in [0.39, 0.61] {
+                let along = n * position;
+                let horizontal = py >= along - pin_half && py <= along + pin_half
+                    && ((px >= left - pin_length && px <= left)
+                        || (px >= right && px <= right + pin_length));
+                let vertical = px >= along - pin_half && px <= along + pin_half
+                    && ((py >= top - pin_length && py <= top)
+                        || (py >= bottom && py <= bottom + pin_length));
+                if horizontal || vertical {
+                    coverage = 1.0;
+                }
+            }
+            out[(y * size + x) as usize] = coverage;
+        }
+    }
+    out
 }
 
 fn rounded_rect_cov(x: f32, y: f32, l: f32, t: f32, r: f32, b: f32, rad: f32) -> f32 {
