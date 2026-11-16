@@ -211,6 +211,7 @@ pub fn write_state(
                 "as_of": reading.as_of,
                 "error": reading.error,
                 "plan_type": reading.plan_type,
+                "live": reading.live,
                 "windows": windows
             })
         })

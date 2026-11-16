@@ -19,6 +19,7 @@ pub struct Window {
     pub resets_at: Option<i64>,
     pub window_secs: Option<i64>,
     pub reset_since_last_run: bool,
+    pub card_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -30,6 +31,21 @@ pub struct Reading {
     pub as_of: i64,
     pub error: Option<String>,
     pub plan_type: Option<String>,
+    pub live: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexFetchStatus {
+    Live,
+    Fallback,
+    Unauthorized,
+    RateLimited,
+}
+
+pub struct CodexFetch {
+    pub reading: Reading,
+    pub status: CodexFetchStatus,
+    pub auth_mtime: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -131,6 +147,297 @@ pub fn codex_home() -> PathBuf {
         })
 }
 
+fn codex_auth_path() -> PathBuf {
+    codex_home().join("auth.json")
+}
+
+pub fn codex_auth_mtime() -> Option<i64> {
+    fs::metadata(codex_auth_path())
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(unix)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CodexCredentials {
+    access_token: String,
+    account_id: String,
+}
+
+fn parse_codex_auth(text: &str) -> Option<CodexCredentials> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    if value["auth_mode"].as_str()? != "chatgpt" {
+        return None;
+    }
+    let access_token = value["tokens"]["access_token"].as_str()?.trim();
+    let account_id = value["tokens"]["account_id"].as_str()?.trim();
+    if access_token.is_empty() || account_id.is_empty() {
+        return None;
+    }
+    Some(CodexCredentials {
+        access_token: access_token.to_owned(),
+        account_id: account_id.to_owned(),
+    })
+}
+
+fn decode_base64url(value: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(value.len() * 3 / 4);
+    let mut bits = 0u32;
+    let mut count = 0u32;
+    for byte in value.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let digit = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        } as u32;
+        bits = (bits << 6) | digit;
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push((bits >> count) as u8);
+            bits &= (1u32 << count).saturating_sub(1);
+        }
+    }
+    Some(out)
+}
+
+fn jwt_exp(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = decode_base64url(payload)?;
+    serde_json::from_slice::<Value>(&decoded).ok()?["exp"].as_i64()
+}
+
+fn chatgpt_base_url(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (key, value) = line.split_once('=')?;
+        if key.trim() != "chatgpt_base_url" {
+            return None;
+        }
+        let value = value.trim();
+        if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
+            return None;
+        }
+        let value = value[1..value.len() - 1].trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+fn codex_usage_url_from_config(config: Option<&str>) -> String {
+    let base = config.and_then(chatgpt_base_url);
+    match base {
+        Some(base) if base.contains("/backend-api") => {
+            format!("{}/wham/usage", base.trim_end_matches('/'))
+        }
+        Some(base) => format!("{}/api/codex/usage", base.trim_end_matches('/')),
+        None => "https://chatgpt.com/backend-api/wham/usage".into(),
+    }
+}
+
+fn codex_usage_url() -> String {
+    let config = fs::read_to_string(codex_home().join("config.toml")).ok();
+    codex_usage_url_from_config(config.as_deref())
+}
+
+fn split_http_url(url: &str) -> Option<(String, u16, String, bool)> {
+    let (secure, rest, port) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest, 443)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest, 80)
+    } else {
+        return None;
+    };
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_owned(), port, format!("/{path}"), secure))
+}
+
+fn window_key(seconds: i64) -> String {
+    match seconds {
+        18_000 => "5h".into(),
+        604_800 => "week".into(),
+        2_592_000 => "month".into(),
+        value if value > 0 && value % 86_400 == 0 => format!("{}d", value / 86_400),
+        value if value > 0 && value % 3_600 == 0 => format!("{}h", value / 3_600),
+        value => format!("{}h", value.max(0) / 3_600),
+    }
+}
+
+/// Human label for a window key: "5-hour", "Weekly", "Monthly", else the key.
+fn window_label(key: &str) -> String {
+    match key {
+        "5h" => "5-hour".into(),
+        "week" => "Weekly".into(),
+        "month" => "Monthly".into(),
+        other => other.into(),
+    }
+}
+
+fn parse_live_window(value: &Value, label: &str, card_only: bool, now: i64) -> Option<Window> {
+    if value.is_null() {
+        return None;
+    }
+    let seconds = value["limit_window_seconds"].as_i64()?;
+    let resets_at = value["reset_at"].as_i64();
+    let key = window_key(seconds);
+    Some(Window {
+        // Plan windows are named by their length; extra limits keep their own name.
+        label: if card_only {
+            label.to_owned()
+        } else {
+            window_label(&key)
+        },
+        key,
+        percent: value["used_percent"].as_f64()?,
+        resets_at,
+        window_secs: Some(seconds),
+        reset_since_last_run: resets_at.is_some_and(|reset| reset < now),
+        card_only,
+    })
+}
+
+fn parse_codex_usage(value: &Value, now: i64) -> Reading {
+    let limits = &value["rate_limit"];
+    let mut windows = Vec::new();
+    if let Some(window) = parse_live_window(&limits["primary_window"], "Primary", false, now) {
+        windows.push(window);
+    }
+    if let Some(window) = parse_live_window(&limits["secondary_window"], "Secondary", false, now) {
+        windows.push(window);
+    }
+    if let Some(additional) = value["additional_rate_limits"].as_array() {
+        for entry in additional {
+            let Some(label) = entry["name"].as_str().or_else(|| entry["label"].as_str()) else {
+                continue;
+            };
+            let candidates = [
+                &entry["primary_window"],
+                &entry["secondary_window"],
+                &entry["rate_limit"]["primary_window"],
+                &entry["rate_limit"]["secondary_window"],
+                entry,
+            ];
+            if let Some(window) = candidates
+                .into_iter()
+                .find_map(|window| parse_live_window(window, label, true, now))
+            {
+                windows.push(window);
+            }
+        }
+    }
+    Reading {
+        provider: Provider::Codex,
+        account: None,
+        windows,
+        fetched_at: now,
+        as_of: now,
+        error: None,
+        plan_type: value["plan_type"].as_str().map(str::to_owned),
+        live: true,
+    }
+}
+
+fn log_fallback(now: i64, error: Option<String>) -> Reading {
+    let mut reading = read_codex(now);
+    reading.live = false;
+    if error.is_some() || reading.error.is_none() {
+        reading.error = error;
+    }
+    reading
+}
+
+pub fn fetch_codex(now: i64, suppress_auth_mtime: Option<i64>) -> CodexFetch {
+    const LOGIN_NOTE: &str = "Codex login needs refresh: run codex";
+    let auth_path = codex_auth_path();
+    let auth_mtime = fs::metadata(&auth_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(unix);
+    if suppress_auth_mtime.is_some() && suppress_auth_mtime == auth_mtime {
+        return CodexFetch {
+            reading: log_fallback(now, Some(LOGIN_NOTE.into())),
+            status: CodexFetchStatus::Unauthorized,
+            auth_mtime,
+        };
+    }
+    let credentials = fs::read_to_string(auth_path)
+        .ok()
+        .and_then(|text| parse_codex_auth(&text));
+    let Some(credentials) = credentials else {
+        return CodexFetch {
+            reading: log_fallback(now, None),
+            status: CodexFetchStatus::Fallback,
+            auth_mtime,
+        };
+    };
+    if jwt_exp(&credentials.access_token).is_some_and(|expires| expires <= now + 300) {
+        return CodexFetch {
+            reading: log_fallback(now, Some(LOGIN_NOTE.into())),
+            status: CodexFetchStatus::Unauthorized,
+            auth_mtime,
+        };
+    }
+    let url = codex_usage_url();
+    let Some((host, port, path, secure)) = split_http_url(&url) else {
+        return CodexFetch {
+            reading: log_fallback(now, Some("Invalid Codex usage URL".into())),
+            status: CodexFetchStatus::Fallback,
+            auth_mtime,
+        };
+    };
+    let headers = format!(
+        "Authorization: Bearer {}\r\nChatGPT-Account-Id: {}\r\nUser-Agent: taskbar-usage-widget\r\nAccept: application/json",
+        credentials.access_token, credentials.account_id
+    );
+    match crate::http::request_to("GET", &host, port, &path, &headers, None, secure, 15_000) {
+        Ok(response) if response.status == 200 => {
+            match serde_json::from_slice::<Value>(&response.body) {
+                Ok(value) => CodexFetch {
+                    reading: parse_codex_usage(&value, now),
+                    status: CodexFetchStatus::Live,
+                    auth_mtime,
+                },
+                Err(_) => CodexFetch {
+                    reading: log_fallback(now, Some("Bad Codex usage response".into())),
+                    status: CodexFetchStatus::Fallback,
+                    auth_mtime,
+                },
+            }
+        }
+        Ok(response) if matches!(response.status, 401 | 403) => CodexFetch {
+            reading: log_fallback(now, Some(LOGIN_NOTE.into())),
+            status: CodexFetchStatus::Unauthorized,
+            auth_mtime,
+        },
+        Ok(response) if response.status == 429 => CodexFetch {
+            reading: log_fallback(now, Some("Codex usage is rate limited".into())),
+            status: CodexFetchStatus::RateLimited,
+            auth_mtime,
+        },
+        Ok(response) => CodexFetch {
+            reading: log_fallback(now, Some(format!("Codex HTTP {}", response.status))),
+            status: CodexFetchStatus::Fallback,
+            auth_mtime,
+        },
+        Err(error) => CodexFetch {
+            reading: log_fallback(now, Some(error)),
+            status: CodexFetchStatus::Fallback,
+            auth_mtime,
+        },
+    }
+}
+
 fn visit_rollouts(dir: &Path, cutoff: SystemTime, files: &mut Vec<(SystemTime, u64, PathBuf)>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -210,6 +517,7 @@ pub fn read_codex(now: i64) -> Reading {
             as_of: now,
             error: Some("No Codex session modified in the last two days".into()),
             plan_type: None,
+            live: false,
         };
     }
     let mut latest = None;
@@ -235,6 +543,7 @@ pub fn read_codex(now: i64) -> Reading {
         as_of: now,
         error: Some(last_error.unwrap_or_else(|| "No Codex rate-limit event found".into())),
         plan_type: None,
+        live: false,
     })
 }
 
@@ -245,10 +554,7 @@ pub fn parse_codex_line(value: &Value, now: i64, fallback_as_of: i64) -> Option<
     }
     let rate_limits = &payload["rate_limits"];
     let mut windows = Vec::new();
-    for (name, data) in [
-        ("primary", &rate_limits["primary"]),
-        ("secondary", &rate_limits["secondary"]),
-    ] {
+    for data in [&rate_limits["primary"], &rate_limits["secondary"]] {
         if data.is_null() {
             continue;
         }
@@ -262,12 +568,8 @@ pub fn parse_codex_line(value: &Value, now: i64, fallback_as_of: i64) -> Option<
             _ => format!("{}m", minutes),
         };
         windows.push(Window {
+            label: window_label(&key),
             key,
-            label: if name == "primary" {
-                "Primary".into()
-            } else {
-                "Secondary".into()
-            },
             percent: if reset_since_last_run {
                 0.0
             } else {
@@ -276,6 +578,7 @@ pub fn parse_codex_line(value: &Value, now: i64, fallback_as_of: i64) -> Option<
             resets_at,
             window_secs: Some(minutes * 60),
             reset_since_last_run,
+            card_only: false,
         });
     }
     let as_of = value["timestamp"]
@@ -290,6 +593,7 @@ pub fn parse_codex_line(value: &Value, now: i64, fallback_as_of: i64) -> Option<
         as_of,
         error: None,
         plan_type: rate_limits["plan_type"].as_str().map(str::to_owned),
+        live: false,
     })
 }
 
@@ -385,7 +689,8 @@ pub fn window_json(window: &Window, now: i64, recent: Option<f64>) -> Value {
         "ahead_by": pace.ahead_by,
         "projected": pace.projected,
         "full_at": pace.full_at,
-        "reset_since_last_run": window.reset_since_last_run
+        "reset_since_last_run": window.reset_since_last_run,
+        "card_only": window.card_only
     })
 }
 
@@ -419,6 +724,128 @@ mod tests {
         let reset = parse_codex_line(&value, 2500, 1).unwrap();
         assert_eq!(reset.windows[0].percent, 0.0);
         assert!(reset.windows[0].reset_since_last_run);
+    }
+
+    #[test]
+    fn live_codex_plus_weekly_only() {
+        let reading = parse_codex_usage(
+            &json!({
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": null,
+                    "secondary_window": {
+                        "used_percent": 5.0,
+                        "reset_at": 2000,
+                        "limit_window_seconds": 604800
+                    }
+                }
+            }),
+            1000,
+        );
+        assert_eq!(reading.plan_type.as_deref(), Some("plus"));
+        assert_eq!(reading.windows.len(), 1);
+        assert_eq!(reading.windows[0].key, "week");
+        assert!(reading.live);
+    }
+
+    #[test]
+    fn live_codex_pro_both_windows_and_additional_limit() {
+        let reading = parse_codex_usage(
+            &json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {"used_percent":15.0,"reset_at":2000,"limit_window_seconds":18000},
+                    "secondary_window": {"used_percent":5.0,"reset_at":3000,"limit_window_seconds":604800}
+                },
+                "additional_rate_limits": [{
+                    "name": "GPT-5",
+                    "primary_window": {"used_percent":7.0,"reset_at":4000,"limit_window_seconds":2592000}
+                }]
+            }),
+            1000,
+        );
+        assert_eq!(reading.windows.len(), 3);
+        assert_eq!(reading.windows[0].key, "5h");
+        assert_eq!(reading.windows[1].key, "week");
+        assert_eq!(reading.windows[2].key, "month");
+        assert_eq!(reading.windows[2].label, "GPT-5");
+        assert!(reading.windows[2].card_only);
+    }
+
+    #[test]
+    fn live_codex_nulls_and_missing_fields_are_skipped() {
+        let reading = parse_codex_usage(
+            &json!({
+                "rate_limit": {"primary_window": null},
+                "additional_rate_limits": [
+                    {"name":"missing window"},
+                    {"primary_window":{"used_percent":1,"limit_window_seconds":18000}}
+                ]
+            }),
+            1000,
+        );
+        assert!(reading.windows.is_empty());
+        assert_eq!(reading.plan_type, None);
+    }
+
+    #[test]
+    fn live_window_keys_follow_duration() {
+        assert_eq!(window_key(18_000), "5h");
+        assert_eq!(window_key(604_800), "week");
+        assert_eq!(window_key(2_592_000), "month");
+        assert_eq!(window_key(86_400), "1d");
+        assert_eq!(window_key(10_800), "3h");
+    }
+
+    #[test]
+    fn jwt_exp_decodes_padded_and_paddingless_payloads() {
+        let payload = "eyJleHAiOjIwMDAwMDAwMDB9";
+        assert_eq!(
+            jwt_exp(&format!("header.{payload}.signature")),
+            Some(2_000_000_000)
+        );
+        assert_eq!(
+            jwt_exp(&format!("header.{payload}==.signature")),
+            Some(2_000_000_000)
+        );
+        assert_eq!(jwt_exp("header.!bad.signature"), None);
+        assert_eq!(jwt_exp("header.e30.signature"), None);
+    }
+
+    #[test]
+    fn auth_json_requires_chatgpt_mode_and_both_fields() {
+        let valid = parse_codex_auth(
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-token","account_id":"00000000-0000-0000-0000-000000000000"}}"#,
+        )
+        .unwrap();
+        assert_eq!(valid.access_token, "fake-token");
+        assert!(parse_codex_auth(
+            r#"{"auth_mode":"apikey","tokens":{"access_token":"fake-token","account_id":"00000000-0000-0000-0000-000000000000"}}"#
+        )
+        .is_none());
+        assert!(parse_codex_auth(r#"{"auth_mode":"chatgpt","tokens":{}}"#).is_none());
+    }
+
+    #[test]
+    fn config_base_url_uses_only_active_assignment() {
+        assert_eq!(
+            codex_usage_url_from_config(Some(
+                "chatgpt_base_url = \"https://example.test/backend-api\""
+            )),
+            "https://example.test/backend-api/wham/usage"
+        );
+        assert_eq!(
+            codex_usage_url_from_config(Some("# chatgpt_base_url = \"https://ignored.test\"")),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+        assert_eq!(
+            codex_usage_url_from_config(None),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+        assert_eq!(
+            codex_usage_url_from_config(Some("chatgpt_base_url = \"https://example.test/custom\"")),
+            "https://example.test/custom/api/codex/usage"
+        );
     }
 
     #[test]

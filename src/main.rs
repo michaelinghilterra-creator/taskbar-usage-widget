@@ -257,6 +257,11 @@ struct State {
     codex_critical_since: [Option<Instant>; 2],
     codex_sig: Vec<(PathBuf, u64, i64)>,
     codex_checked_at: i64,
+    codex_next_fetch: i64,
+    codex_fetching: bool,
+    codex_rate_limited: u32,
+    codex_rejected_mtime: Option<i64>,
+    codex_auth_retry_at: i64,
     spark: Option<providers::SparkSnapshot>,
     spark_history: Vec<(i64, f64, f64)>,
     history: Option<storage::History>,
@@ -288,7 +293,9 @@ thread_local! {
         font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, ring_margin: DEFAULT_RING_MARGIN, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
         show_claude: true, show_codex: true, show_spark: true, spark_host: String::new(), codex: None,
         codex_critical_active: [false; 2], codex_critical_since: [None; 2],
-        codex_sig: Vec::new(), codex_checked_at: 0, spark: None, spark_history: Vec::new(), history: None,
+        codex_sig: Vec::new(), codex_checked_at: 0, codex_next_fetch: 0, codex_fetching: false,
+        codex_rate_limited: 0, codex_rejected_mtime: None, codex_auth_retry_at: 0,
+        spark: None, spark_history: Vec::new(), history: None,
         token_tracker: std::sync::Arc::new(std::sync::Mutex::new(tokens::Tracker::default())),
         token_totals: tokens::Totals { claude: 0, claude_output: 0, codex: 0 }, tokens_checked_at: 0,
         alerts: true, alerted_periods: HashMap::new(), high_windows: HashMap::new(), spark_was_up: None,
@@ -792,7 +799,7 @@ fn ensure_widget() {
                 .codex
                 .as_ref()
                 .map(|c| {
-                    let find = |k: &str| c.windows.iter().find(|w| w.key == k);
+                    let find = |k: &str| c.windows.iter().find(|w| !w.card_only && w.key == k);
                     let mk = |w: Option<&providers::Window>| w.map(|x| x.percent);
                     let pp = |w: Option<&providers::Window>| {
                         w.map(|x| {
@@ -1220,19 +1227,27 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
             add_flyout_windows(&mut section, reading, t);
             section.empty = section.bars.is_empty();
             section.error = reading.error.as_ref().and_then(|_| {
-                (!section.bars.is_empty()).then(|| {
-                    format!(
-                        "Can't reach chatgpt.com \u{00b7} showing {} values",
+                if reading.error.as_deref() == Some("Codex login needs refresh: run codex") {
+                    reading.error.clone()
+                } else if !section.bars.is_empty() {
+                    Some(format!(
+                        "Can't reach chatgpt.com \u{00b7} showing cached values from {}",
                         local_time(reading.as_of, false)
-                    )
-                })
+                    ))
+                } else {
+                    reading.error.clone()
+                }
             });
             section.today = if s.tokens_checked_at == 0 {
                 "Counting tokens".into()
             } else {
                 format!("{} today", compact_number(s.token_totals.codex))
             };
-            section.as_of = age_copy(t - reading.as_of, section.stale);
+            section.as_of = if reading.live {
+                "live".into()
+            } else {
+                format!("from logs, {}", age_copy(t - reading.as_of, false))
+            };
             sections.push(section);
         } else {
             sections.push(flyout::Section {
@@ -1855,63 +1870,98 @@ struct ProviderResult {
     codex: providers::Reading,
     codex_sig: Vec<(PathBuf, u64, i64)>,
     codex_checked: bool,
+    codex_status: Option<providers::CodexFetchStatus>,
+    codex_auth_mtime: Option<i64>,
     spark: Option<providers::SparkSnapshot>,
     tokens: Option<tokens::Totals>,
 }
 
 fn start_provider_fetch() {
-    let (ctl, host, fake, old_codex, old_sig, due, tracker, dirs, tokens_due) = with(|s| {
-        (
-            s.ctl as isize,
-            s.spark_host.clone(),
-            s.fake_data,
-            s.codex.clone(),
-            s.codex_sig.clone(),
-            now() - s.codex_checked_at >= 60,
-            s.token_tracker.clone(),
-            s.accounts
-                .iter()
-                .map(|account| account.dir.clone())
-                .collect::<Vec<_>>(),
-            now() - s.tokens_checked_at >= 60,
-        )
-    });
+    let (ctl, host, fake, old_codex, old_sig, due, suppress_auth, tracker, dirs, tokens_due) =
+        with(|s| {
+            let auth_mtime = providers::codex_auth_mtime();
+            let auth_changed =
+                s.codex_rejected_mtime.is_some() && auth_mtime != s.codex_rejected_mtime;
+            let due = !s.codex_fetching && (now() >= s.codex_next_fetch || auth_changed);
+            if due {
+                s.codex_fetching = true;
+            }
+            let suppress_auth = (now() < s.codex_auth_retry_at
+                && auth_mtime == s.codex_rejected_mtime)
+                .then_some(auth_mtime)
+                .flatten();
+            (
+                s.ctl as isize,
+                s.spark_host.clone(),
+                s.fake_data,
+                s.codex.clone(),
+                s.codex_sig.clone(),
+                due,
+                suppress_auth,
+                s.token_tracker.clone(),
+                s.accounts
+                    .iter()
+                    .map(|account| account.dir.clone())
+                    .collect::<Vec<_>>(),
+                now() - s.tokens_checked_at >= 60,
+            )
+        });
     std::thread::spawn(move || {
         let t = now();
         let signature = providers::codex_files_signature();
-        let codex = if !due {
-            old_codex.unwrap_or_else(|| providers::read_codex(t))
-        } else if !fake && signature == old_sig && old_codex.is_some() {
-            old_codex.unwrap()
+        let (codex, codex_status, codex_auth_mtime) = if !due {
+            let refresh_logs =
+                old_codex.as_ref().is_some_and(|reading| !reading.live) && signature != old_sig;
+            (
+                if refresh_logs {
+                    let mut reading = providers::read_codex(t);
+                    if let Some(error) = old_codex.as_ref().and_then(|old| old.error.clone()) {
+                        reading.error = Some(error);
+                    }
+                    reading
+                } else {
+                    old_codex.unwrap_or_else(|| providers::read_codex(t))
+                },
+                None,
+                None,
+            )
         } else if fake {
-            providers::Reading {
-                provider: providers::Provider::Codex,
-                account: None,
-                windows: vec![
-                    providers::Window {
-                        key: "week".into(),
-                        label: "Weekly".into(),
-                        percent: 37.0,
-                        resets_at: Some(t + 4 * 86400),
-                        window_secs: Some(604800),
-                        reset_since_last_run: false,
-                    },
-                    providers::Window {
-                        key: "5h".into(),
-                        label: "5-hour".into(),
-                        percent: 18.0,
-                        resets_at: Some(t + 7200),
-                        window_secs: Some(18000),
-                        reset_since_last_run: false,
-                    },
-                ],
-                fetched_at: t,
-                as_of: t,
-                error: None,
-                plan_type: Some("dev".into()),
-            }
+            (
+                providers::Reading {
+                    provider: providers::Provider::Codex,
+                    account: None,
+                    windows: vec![
+                        providers::Window {
+                            key: "week".into(),
+                            label: "Weekly".into(),
+                            percent: 37.0,
+                            resets_at: Some(t + 4 * 86400),
+                            window_secs: Some(604800),
+                            reset_since_last_run: false,
+                            card_only: false,
+                        },
+                        providers::Window {
+                            key: "5h".into(),
+                            label: "5-hour".into(),
+                            percent: 18.0,
+                            resets_at: Some(t + 7200),
+                            window_secs: Some(18000),
+                            reset_since_last_run: false,
+                            card_only: false,
+                        },
+                    ],
+                    fetched_at: t,
+                    as_of: t,
+                    error: None,
+                    plan_type: Some("dev".into()),
+                    live: true,
+                },
+                Some(providers::CodexFetchStatus::Live),
+                None,
+            )
         } else {
-            providers::read_codex(t)
+            let fetched = providers::fetch_codex(t, suppress_auth);
+            (fetched.reading, Some(fetched.status), fetched.auth_mtime)
         };
         let spark = if host.is_empty() {
             None
@@ -1935,6 +1985,8 @@ fn start_provider_fetch() {
             codex,
             codex_sig: signature,
             codex_checked: due,
+            codex_status,
+            codex_auth_mtime,
             spark,
             tokens,
         });
@@ -1963,6 +2015,7 @@ fn claude_readings(s: &State, t: i64) -> Vec<providers::Reading> {
                         resets_at: l.resets_at,
                         window_secs: Some(18000),
                         reset_since_last_run: false,
+                        card_only: false,
                     });
                 }
                 if let Some(l) = u.weekly {
@@ -1973,6 +2026,7 @@ fn claude_readings(s: &State, t: i64) -> Vec<providers::Reading> {
                         resets_at: l.resets_at,
                         window_secs: Some(604800),
                         reset_since_last_run: false,
+                        card_only: false,
                     });
                 }
                 for e in &u.extra {
@@ -1983,6 +2037,7 @@ fn claude_readings(s: &State, t: i64) -> Vec<providers::Reading> {
                         resets_at: e.limit.resets_at,
                         window_secs: Some(e.window_secs),
                         reset_since_last_run: false,
+                        card_only: false,
                     });
                 }
             }
@@ -1994,6 +2049,7 @@ fn claude_readings(s: &State, t: i64) -> Vec<providers::Reading> {
                 as_of: a.last_ok.unwrap_or(t),
                 error: a.error.clone(),
                 plan_type: None,
+                live: false,
             }
         })
         .collect()
@@ -2051,7 +2107,48 @@ fn on_provider_result(r: ProviderResult) {
         s.codex = Some(r.codex);
         s.codex_sig = r.codex_sig;
         if r.codex_checked {
-            s.codex_checked_at = now();
+            let t = now();
+            s.codex_fetching = false;
+            s.codex_checked_at = t;
+            let status = r
+                .codex_status
+                .unwrap_or(providers::CodexFetchStatus::Fallback);
+            if status == providers::CodexFetchStatus::RateLimited {
+                s.codex_rate_limited = s.codex_rate_limited.saturating_add(1);
+            } else {
+                s.codex_rate_limited = 0;
+            }
+            if status == providers::CodexFetchStatus::Unauthorized {
+                s.codex_rejected_mtime = r.codex_auth_mtime;
+                s.codex_auth_retry_at = t + 900;
+            } else {
+                s.codex_rejected_mtime = None;
+                s.codex_auth_retry_at = 0;
+            }
+            let mut wait = if s.fake_data {
+                FAKE_DATA_SECS
+            } else if session_inactive() {
+                900
+            } else {
+                backoff_secs(120, s.codex_rate_limited)
+            };
+            if status == providers::CodexFetchStatus::Unauthorized {
+                wait = 900;
+            }
+            if let Some(reset) = s
+                .codex
+                .iter()
+                .flat_map(|reading| reading.windows.iter())
+                .filter_map(|window| window.resets_at)
+                .filter(|reset| *reset > t)
+                .min()
+            {
+                let until = (reset - t) as u32;
+                if until <= wait {
+                    wait = until.saturating_add(30);
+                }
+            }
+            s.codex_next_fetch = t + wait as i64;
         }
         s.spark = r.spark;
         if let Some(tokens) = r.tokens {

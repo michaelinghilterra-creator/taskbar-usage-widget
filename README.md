@@ -61,7 +61,7 @@ If you run Claude Code with another config folder (e.g. `CLAUDE_CONFIG_DIR=$HOME
 
 ## Privacy
 
-Claude usage is read from `api.anthropic.com` and `platform.claude.com`. Codex usage is read locally from only `token_count` events in `%CODEX_HOME%\sessions` (or `%USERPROFILE%\.codex\sessions`); conversation text is never copied. Spark stats are requested only from the LAN host you configure. The widget writes `%LOCALAPPDATA%\TaskbarUsageWidget\state.json` and `history.jsonl`, plus settings under `HKEY_CURRENT_USER\Software\TaskbarUsageWidget`. OAuth tokens are never logged or stored in those files. There are no analytics or update checks.
+Claude usage is read from `api.anthropic.com` and `platform.claude.com`. Codex usage is read from `chatgpt.com`, with local `token_count` events in `%CODEX_HOME%\sessions` (or `%USERPROFILE%\.codex\sessions`) as a fallback; conversation text is never copied. The Codex CLI login is read only and is never refreshed or written by the widget. Spark stats are requested only from the LAN host you configure. The widget writes `%LOCALAPPDATA%\TaskbarUsageWidget\state.json` and `history.jsonl`, plus settings under `HKEY_CURRENT_USER\Software\TaskbarUsageWidget`. OAuth tokens are never logged or stored in those files. There are no analytics or update checks.
 
 MCP mode reads the widget's local `state.json`, local Codex rollout metadata, and the configured Spark host only. It never reads Claude credentials or refreshes Claude tokens, and it labels Claude logins as `account 1`, `account 2`, and so on instead of exposing email addresses or paths.
 
