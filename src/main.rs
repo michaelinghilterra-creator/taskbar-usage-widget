@@ -59,6 +59,7 @@ const ID_SHOW_CODEX: usize = 25;
 const ID_SHOW_SPARK: usize = 26;
 const ID_SPARK_ADDRESS: usize = 27;
 const ID_ALERTS: usize = 28;
+const ID_CARD_SHOW_LEFT: usize = 29;
 const ID_AUTOSTART: usize = 3;
 const ID_EXIT: usize = 4;
 const ID_SHOW_LEFT: usize = 5;
@@ -218,6 +219,8 @@ struct State {
     interval: u32,
     /// Show what's left instead of what's used.
     show_left: bool,
+    /// Show what's left instead of what's used in the card only.
+    card_show_left: bool,
     /// Text size in pixels at 100% scaling.
     font_size: u32,
     icon_size: u32,
@@ -281,7 +284,7 @@ thread_local! {
         taskbar_created_msg: 0, accounts: Vec::new(), next_id: 0,
         hover: false, hover_since: None, leave_since: None, last_flyout_draw: None,
         dark: false, rendered: None, pos: (0, 0, 0, 0),
-        interval: DEFAULT_INTERVAL, show_left: false,
+        interval: DEFAULT_INTERVAL, show_left: false, card_show_left: false,
         font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, ring_margin: DEFAULT_RING_MARGIN, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
         show_claude: true, show_codex: true, show_spark: true, spark_host: String::new(), codex: None,
         codex_critical_active: [false; 2], codex_critical_since: [None; 2],
@@ -393,6 +396,7 @@ fn main() {
                 .filter(|v| (30..=1800).contains(v))
                 .unwrap_or(DEFAULT_INTERVAL);
             s.show_left = read_setting("ShowRemaining") == Some(1);
+            s.card_show_left = read_setting("CardShowRemaining") == Some(1);
             s.icon_size = read_setting("IconSize")
                 .filter(|v| ICON_SIZES.iter().any(|(px, _)| px == v))
                 .unwrap_or(DEFAULT_ICON_SIZE);
@@ -1164,19 +1168,25 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                 } else {
                     String::new()
                 },
-                stale: reading.error.is_some() || t - reading.as_of > 600,
-                error: reading.error.clone(),
+                stale: t - reading.as_of > 600,
+                loading: s.accounts[index].usage.is_none() && s.accounts[index].fetching,
                 ..Default::default()
             };
             add_flyout_windows(&mut section, &reading, t);
+            section.as_of = age_copy(t - reading.as_of, section.stale);
+            section.empty = section.bars.is_empty() && !section.loading;
+            section.error = reading.error.as_ref().and_then(|_| {
+                (!section.bars.is_empty()).then(|| {
+                    format!(
+                        "Can't reach claude.ai \u{00b7} showing {} values",
+                        local_time(reading.as_of, false)
+                    )
+                })
+            });
             section.today = if s.tokens_checked_at == 0 {
-                "Today: counting...".into()
+                "Counting tokens".into()
             } else {
-                format!(
-                    "Today: {} tokens · {} out",
-                    compact_number(s.token_totals.claude),
-                    compact_number(s.token_totals.claude_output)
-                )
+                format!("{} tokens today", compact_number(s.token_totals.claude))
             };
             if let Some(history) = &s.history {
                 section.chart = history
@@ -1199,18 +1209,34 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                     .as_deref()
                     .map(title_case)
                     .unwrap_or_default(),
-                stale: reading.error.is_some() || t - reading.as_of > 21600,
-                error: reading.error.clone(),
+                stale: t - reading.as_of > 21600,
                 ..Default::default()
             };
             add_flyout_windows(&mut section, reading, t);
+            section.empty = section.bars.is_empty();
+            section.error = reading.error.as_ref().and_then(|_| {
+                (!section.bars.is_empty()).then(|| {
+                    format!(
+                        "Can't reach chatgpt.com \u{00b7} showing {} values",
+                        local_time(reading.as_of, false)
+                    )
+                })
+            });
             section.today = if s.tokens_checked_at == 0 {
-                "Today: counting...".into()
+                "Counting tokens".into()
             } else {
-                format!("Today: {} tokens", compact_number(s.token_totals.codex))
+                format!("{} today", compact_number(s.token_totals.codex))
             };
-            section.as_of = format!("as of {} ago", human_short(t - reading.as_of));
+            section.as_of = age_copy(t - reading.as_of, section.stale);
             sections.push(section);
+        } else {
+            sections.push(flyout::Section {
+                provider: flyout::ProviderKind::Codex,
+                title: "Codex".into(),
+                loading: s.codex_checked_at == 0,
+                empty: s.codex_checked_at != 0,
+                ..Default::default()
+            });
         }
     }
     if s.show_spark {
@@ -1279,7 +1305,8 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
             section.stale = t - spark.fetched_at > 30;
             section.chart = s.spark_history.iter().map(|sample| sample.1).collect();
         } else {
-            section.error = Some("Not configured".into());
+            section.loading = !s.spark_host.is_empty();
+            section.empty = s.spark_host.is_empty();
         }
         sections.push(section);
     }
@@ -1293,7 +1320,9 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
         .unwrap_or(t);
     flyout::Snapshot {
         sections,
-        updated: format!("updated {} ago", human_short(t - newest)),
+        updated: age_copy(t - newest, false),
+        show_left: s.card_show_left,
+        pulse_alpha: loading_pulse_alpha(),
     }
 }
 
@@ -1313,6 +1342,9 @@ fn add_flyout_windows(section: &mut flyout::Section, reading: &providers::Readin
         section.bars.push(flyout::Bar {
             label: window.label.clone(),
             percent: window.percent,
+            previous_percent: None,
+            number_progress: 1.0,
+            meter_percent: None,
             elapsed: pace.elapsed_pct,
             reset,
             ahead_by: pace.ahead_by,
@@ -1326,12 +1358,20 @@ fn add_flyout_windows(section: &mut flyout::Section, reading: &providers::Readin
 
 fn compact_number(value: u64) -> String {
     if value >= 1_000_000 {
-        format!("{:.1}m", value as f64 / 1_000_000.0)
+        format!("{:.1} M", value as f64 / 1_000_000.0)
     } else if value >= 1_000 {
-        format!("{:.1}k", value as f64 / 1_000.0)
+        format!("{:.1} k", value as f64 / 1_000.0)
     } else {
         value.to_string()
     }
+}
+
+fn age_copy(seconds: i64, stale: bool) -> String {
+    format!(
+        "{} {}",
+        human_short(seconds),
+        if stale { "old" } else { "ago" }
+    )
 }
 
 fn human_short(seconds: i64) -> String {
@@ -2524,6 +2564,12 @@ unsafe fn show_menu() {
         ID_SHOW_LEFT,
         w!("Show remaining instead of used"),
     );
+    AppendMenuW(
+        menu,
+        tick(ID_CARD_SHOW_LEFT),
+        ID_CARD_SHOW_LEFT,
+        w!("Card number: left instead of used"),
+    );
     let custom = CreatePopupMenu();
     let fonts = CreatePopupMenu();
     for (i, (_, label)) in FONT_SIZES.iter().enumerate() {
@@ -2777,6 +2823,7 @@ fn setting_checked(id: usize) -> Option<bool> {
     with(|s| {
         Some(match id {
             ID_SHOW_LEFT => s.show_left,
+            ID_CARD_SHOW_LEFT => s.card_show_left,
             ID_SHOW_CLAUDE => s.show_claude,
             ID_SHOW_CODEX => s.show_codex,
             ID_SHOW_SPARK => s.show_spark,
@@ -2855,6 +2902,16 @@ fn apply_setting(id: usize) -> bool {
             });
             write_setting("ShowRemaining", on as u32);
             ensure_widget();
+        }
+        ID_CARD_SHOW_LEFT => {
+            let on = with(|s| {
+                s.card_show_left = !s.card_show_left;
+                s.card_show_left
+            });
+            write_setting("CardShowRemaining", on as u32);
+            if flyout::is_open() {
+                unsafe { update_flyout() };
+            }
         }
         ID_RINGS => {
             let on = with(|s| {

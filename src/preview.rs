@@ -51,6 +51,14 @@ pub fn run(output: &Path) -> Result<Vec<PathBuf>, String> {
         write_bmp_u32(&path, width, height, &pixels).map_err(|error| error.to_string())?;
         written.push(path);
 
+        for width in [330, 300] {
+            let (card_width, height, pixels) =
+                flyout::render_at_width(&snapshot, dark, 96, false, width);
+            let path = output.join(format!("flyout-{theme}-100-{width}.bmp"));
+            write_bmp_u32(&path, card_width, height, &pixels).map_err(|error| error.to_string())?;
+            written.push(path);
+        }
+
         let path = output.join(format!("flyout-{theme}-150-states.bmp"));
         write_flyout_states(&path, dark, now, &spark_points).map_err(|error| error.to_string())?;
         written.push(path);
@@ -65,9 +73,11 @@ pub fn run(output: &Path) -> Result<Vec<PathBuf>, String> {
 fn write_flyout_states(path: &Path, dark: bool, now: i64, spark_points: &[f32]) -> io::Result<()> {
     let state = fake_state(now);
     let mut mixed = flyout_model(&state, now, spark_points);
+    mixed.pulse_alpha = 1.0;
     for section in &mut mixed.sections {
         match section.provider {
             flyout::ProviderKind::Claude => {
+                section.stale = false;
                 if let Some(bar) = section.bars.first_mut() {
                     bar.percent = 68.0;
                     bar.elapsed = 40.0;
@@ -85,7 +95,7 @@ fn write_flyout_states(path: &Path, dark: bool, now: i64, spark_points: &[f32]) 
             }
         }
     }
-    let empty = flyout::Snapshot {
+    let mut empty = flyout::Snapshot {
         updated: "Loading".into(),
         sections: vec![
             flyout::Section {
@@ -100,7 +110,22 @@ fn write_flyout_states(path: &Path, dark: bool, now: i64, spark_points: &[f32]) 
                 ..Default::default()
             },
         ],
+        ..Default::default()
     };
+    empty.updated = "24 s ago".into();
+    empty.pulse_alpha = 0.68;
+    empty.sections[0].loading = true;
+    empty.sections[0].chip.clear();
+    empty.sections[1].title = "Codex".into();
+    empty.sections[1].empty = true;
+    let mut cached = mixed
+        .sections
+        .iter()
+        .find(|section| section.provider == flyout::ProviderKind::Claude)
+        .cloned()
+        .expect("fake preview has Claude");
+    cached.error = Some("Can't reach claude.ai \u{00b7} showing 10:31 PM values".into());
+    empty.sections.push(cached);
     let cards = [
         flyout::render(&mixed, dark, 144, false),
         flyout::render(&empty, dark, 144, false),
@@ -392,6 +417,9 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
             section.bars.push(flyout::Bar {
                 label: window["label"].as_str().unwrap_or("Window").to_owned(),
                 percent,
+                previous_percent: None,
+                number_progress: 1.0,
+                meter_percent: None,
                 elapsed: pace.elapsed_pct,
                 reset: reset
                     .map(|at| crate::local_time(at, at - now > 86400))
@@ -480,9 +508,11 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
     flyout::Snapshot {
         sections,
         updated: format!(
-            "updated {} ago",
+            "{} ago",
             short_age(now - state["written_at"].as_i64().unwrap_or(now))
         ),
+        pulse_alpha: 1.0,
+        ..Default::default()
     }
 }
 
@@ -517,17 +547,16 @@ fn compact(value: u64) -> String {
 
 fn token_text(state: &Value, claude: bool) -> String {
     if state["tokens"]["checked_at"].as_i64().unwrap_or(0) == 0 {
-        return "Today: counting...".into();
+        return "Counting tokens".into();
     }
     if claude {
         format!(
-            "Today: {} tokens · {} out",
-            compact(state["tokens"]["claude"].as_u64().unwrap_or(0)),
-            compact(state["tokens"]["claude_output"].as_u64().unwrap_or(0))
+            "{} tokens today",
+            compact(state["tokens"]["claude"].as_u64().unwrap_or(0))
         )
     } else {
         format!(
-            "Today: {} tokens",
+            "{} today",
             compact(state["tokens"]["codex"].as_u64().unwrap_or(0))
         )
     }
@@ -572,7 +601,7 @@ fn fake_state(now: i64) -> Value {
         "_preview_fake": true,
         "written_at": now,
         "readings": [
-            {"provider":"claude","as_of":now-3600,"windows":[window("5h","5-hour",62.0,18000),window("week","Weekly",38.0,604800)]},
+            {"provider":"claude","as_of":now-60,"windows":[window("5h","5-hour",62.0,18000),window("week","Weekly",38.0,604800)]},
             {"provider":"codex","as_of":now-300,"plan_type":"plus","windows":[window("5h","5-hour",15.0,18000),window("week","Weekly",9.0,604800)]}
         ],
         "spark": {
