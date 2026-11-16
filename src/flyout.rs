@@ -102,6 +102,8 @@ pub struct Snapshot {
     pub updated: String,
     pub show_left: bool,
     pub pulse_alpha: f32,
+    pub router_pill: String,
+    pub router_good: bool,
 }
 
 #[allow(dead_code)]
@@ -969,6 +971,37 @@ unsafe fn draw_e2_content(
     }
     SelectObject(dc, f14b);
     draw_text(dc, s(17.0), s(17.0), "Usage", palette.text);
+    if !snapshot.router_pill.is_empty() {
+        SelectObject(dc, f10);
+        let pill_left = s(72.0);
+        let pill_width = text_width(dc, &snapshot.router_pill) + s(16.0);
+        let color = if snapshot.router_good {
+            palette.good
+        } else {
+            palette.warn
+        };
+        fill_rounded(
+            dc,
+            pill_left,
+            s(13.0),
+            pill_left + pill_width,
+            s(34.0),
+            s(9.0),
+            blend_color(palette.card, color, 0.16),
+        );
+        draw_text_rect(
+            dc,
+            RECT {
+                left: pill_left + s(8.0),
+                top: s(13.0),
+                right: pill_left + pill_width - s(8.0),
+                bottom: s(34.0),
+            },
+            &snapshot.router_pill,
+            color,
+            DT_CENTER,
+        );
+    }
     let refresh = controls[2].1;
     let pin = controls[1].1;
     let close = controls[0].1;

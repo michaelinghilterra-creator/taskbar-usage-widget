@@ -2,11 +2,13 @@
 
 mod api;
 mod flyout;
+mod hook;
 mod http;
 mod mcp;
 mod preview;
 mod providers;
 mod render;
+mod router;
 mod storage;
 mod tokens;
 
@@ -60,6 +62,7 @@ const ID_SHOW_SPARK: usize = 26;
 const ID_SPARK_ADDRESS: usize = 27;
 const ID_ALERTS: usize = 28;
 const ID_CARD_SHOW_LEFT: usize = 29;
+const ID_CONNECT_CLAUDE_CODE: usize = 30;
 const ID_AUTOSTART: usize = 3;
 const ID_EXIT: usize = 4;
 const ID_SHOW_LEFT: usize = 5;
@@ -169,6 +172,8 @@ struct Account {
     /// While the numbers roll: the usage before the last update, and when it arrived.
     prev: Option<(api::Usage, Instant)>,
     last_ok: Option<i64>,
+    /// Loaded from state.json and deliberately stale until a live fetch succeeds.
+    startup_cached: bool,
     error: Option<String>,
     fetching: bool,
     /// Rate-limit errors in a row; each one doubles the wait.
@@ -187,6 +192,7 @@ impl Account {
             usage: None,
             prev: None,
             last_ok: None,
+            startup_cached: false,
             error: None,
             fetching: false,
             rate_limited: 0,
@@ -196,7 +202,8 @@ impl Account {
     }
 
     fn is_stale(&self) -> bool {
-        self.error.is_some() && self.last_ok.map_or(true, |t| now() - t > 600)
+        self.startup_cached
+            || (self.error.is_some() && self.last_ok.map_or(true, |t| now() - t > 600))
     }
 }
 
@@ -253,6 +260,7 @@ struct State {
     show_spark: bool,
     spark_host: String,
     codex: Option<providers::Reading>,
+    codex_startup_cached: bool,
     codex_critical_active: [bool; 2],
     codex_critical_since: [Option<Instant>; 2],
     codex_sig: Vec<(PathBuf, u64, i64)>,
@@ -263,6 +271,7 @@ struct State {
     codex_rejected_mtime: Option<i64>,
     codex_auth_retry_at: i64,
     spark: Option<providers::SparkSnapshot>,
+    spark_startup_cached: bool,
     spark_history: Vec<(i64, f64, f64)>,
     history: Option<storage::History>,
     token_tracker: std::sync::Arc<std::sync::Mutex<tokens::Tracker>>,
@@ -291,11 +300,11 @@ thread_local! {
         dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false, card_show_left: false,
         font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, ring_margin: DEFAULT_RING_MARGIN, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
-        show_claude: true, show_codex: true, show_spark: true, spark_host: String::new(), codex: None,
+        show_claude: true, show_codex: true, show_spark: true, spark_host: String::new(), codex: None, codex_startup_cached: false,
         codex_critical_active: [false; 2], codex_critical_since: [None; 2],
         codex_sig: Vec::new(), codex_checked_at: 0, codex_next_fetch: 0, codex_fetching: false,
         codex_rate_limited: 0, codex_rejected_mtime: None, codex_auth_retry_at: 0,
-        spark: None, spark_history: Vec::new(), history: None,
+        spark: None, spark_startup_cached: false, spark_history: Vec::new(), history: None,
         token_tracker: std::sync::Arc::new(std::sync::Mutex::new(tokens::Tracker::default())),
         token_totals: tokens::Totals { claude: 0, claude_output: 0, codex: 0 }, tokens_checked_at: 0,
         alerts: true, alerted_periods: HashMap::new(), high_windows: HashMap::new(), spark_was_up: None,
@@ -320,6 +329,10 @@ fn main() {
     let arguments = std::env::args_os().collect::<Vec<_>>();
     if arguments.iter().any(|argument| argument == "--mcp") {
         mcp::run();
+        return;
+    }
+    if arguments.iter().any(|argument| argument == "--hook") {
+        hook::run();
         return;
     }
     if let Some(index) = arguments
@@ -395,6 +408,8 @@ fn main() {
             null(),
         );
         let msg = RegisterWindowMessageW(w!("TaskbarCreated"));
+        let cached_state = mcp::load_cached_state();
+        let startup_now = now();
         with(|s| {
             s.ctl = ctl;
             s.taskbar_created_msg = msg;
@@ -441,6 +456,9 @@ fn main() {
                 s.next_id += 1;
                 s.accounts.push(Account::new(id, dir));
             }
+            if let Some(state) = cached_state.as_ref() {
+                seed_from_state(s, state, startup_now);
+            }
         });
         ensure_widget();
         SetTimer(ctl, T_LAYOUT, 1000, None);
@@ -448,7 +466,7 @@ fn main() {
         SetTimer(ctl, T_ROLL, 15, None);
         with(|s| s.history = storage::History::load(now()).ok());
         SetTimer(ctl, T_PROVIDER, provider_poll_ms(), None);
-        start_fetch_all();
+        start_initial_claude_fetches();
         start_provider_fetch();
 
         let mut m: MSG = std::mem::zeroed();
@@ -460,6 +478,164 @@ fn main() {
 }
 
 // ---------- data ----------
+
+fn stored_window(value: &serde_json::Value) -> Option<providers::Window> {
+    Some(providers::Window {
+        key: value["key"].as_str()?.to_owned(),
+        label: value["label"].as_str().unwrap_or("Window").to_owned(),
+        percent: value["percent"].as_f64()?,
+        resets_at: value["resets_at"].as_i64(),
+        window_secs: value["window_secs"].as_i64(),
+        reset_since_last_run: value["reset_since_last_run"].as_bool().unwrap_or(false),
+        card_only: value["card_only"].as_bool().unwrap_or(false),
+    })
+}
+
+fn stored_reading(value: &serde_json::Value) -> Option<providers::Reading> {
+    let provider = match value["provider"].as_str()? {
+        "claude" => providers::Provider::Claude,
+        "codex" => providers::Provider::Codex,
+        _ => return None,
+    };
+    Some(providers::Reading {
+        provider,
+        account: value["account"].as_str().map(str::to_owned),
+        windows: value["windows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(stored_window)
+            .collect(),
+        fetched_at: value["fetched_at"].as_i64().unwrap_or(0),
+        as_of: value["as_of"].as_i64().unwrap_or(0),
+        error: value["error"].as_str().map(str::to_owned),
+        plan_type: value["plan_type"].as_str().map(str::to_owned),
+        live: value["live"].as_bool().unwrap_or(false),
+    })
+}
+
+fn claude_usage_from_reading(reading: &providers::Reading) -> Option<api::Usage> {
+    if reading.windows.is_empty() {
+        return None;
+    }
+    let mut usage = api::Usage::default();
+    for window in &reading.windows {
+        let limit = api::Limit {
+            percent: window.percent,
+            resets_at: window.resets_at,
+        };
+        match window.key.as_str() {
+            "5h" => {
+                usage.five_hour = Some(limit);
+                usage.has_five_hour = true;
+            }
+            "week" => usage.weekly = Some(limit),
+            "fable" => usage.fable = Some(limit),
+            _ => usage.extra.push(api::ExtraLimit {
+                key: window.key.clone(),
+                label: window.label.clone(),
+                limit,
+                window_secs: window.window_secs.unwrap_or(0),
+            }),
+        }
+    }
+    Some(usage)
+}
+
+fn stored_spark(value: &serde_json::Value) -> Option<providers::SparkSnapshot> {
+    (!value.is_null()).then(|| providers::SparkSnapshot {
+        fetched_at: value["fetched_at"].as_i64().unwrap_or(0),
+        up: value["up"].as_bool().unwrap_or(false),
+        tok_s: value["tok_s"].as_f64().unwrap_or(0.0),
+        gpu_util: value["gpu_util"].as_f64().unwrap_or(0.0),
+        busy: value["busy"].as_bool().unwrap_or(false),
+        endpoints: value["endpoints"].as_array().cloned().unwrap_or_default(),
+        sys: value["sys"].clone(),
+        host: value["host"].clone(),
+        aux: value["aux"].as_array().cloned().unwrap_or_default(),
+        error: value["error"].as_str().map(str::to_owned),
+    })
+}
+
+fn seed_from_state(s: &mut State, state: &serde_json::Value, startup_now: i64) {
+    let stored = state["readings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(stored_reading)
+        .collect::<Vec<_>>();
+    let claude = stored
+        .iter()
+        .filter(|reading| reading.provider == providers::Provider::Claude)
+        .collect::<Vec<_>>();
+    for (index, account) in s.accounts.iter_mut().enumerate() {
+        let reading = claude
+            .iter()
+            .copied()
+            .find(|reading| reading.account.as_deref() == Some(account.label.as_str()))
+            .or_else(|| claude.get(index).copied());
+        let Some(reading) = reading else { continue };
+        let Some(usage) = claude_usage_from_reading(reading) else {
+            continue;
+        };
+        account.usage = Some(usage);
+        account.last_ok = Some(reading.as_of.max(reading.fetched_at));
+        account.error = reading.error.clone();
+        account.startup_cached = true;
+    }
+    if let Some(reading) = stored.into_iter().find(|reading| {
+        reading.provider == providers::Provider::Codex && !reading.windows.is_empty()
+    }) {
+        s.codex_checked_at = reading.fetched_at.max(reading.as_of);
+        s.codex = Some(reading);
+        s.codex_startup_cached = true;
+    }
+    if !s.spark_host.is_empty() {
+        if let Some(spark) = state.get("spark").and_then(stored_spark) {
+            s.spark_history
+                .push((spark.fetched_at, spark.tok_s, spark.gpu_util));
+            s.spark = Some(spark);
+            s.spark_startup_cached = true;
+        }
+    }
+    let tokens = &state["tokens"];
+    s.token_totals = tokens::Totals {
+        claude: tokens["claude"].as_u64().unwrap_or(0),
+        claude_output: tokens["claude_output"].as_u64().unwrap_or(0),
+        codex: tokens["codex"].as_u64().unwrap_or(0),
+    };
+    s.tokens_checked_at = tokens["checked_at"].as_i64().unwrap_or(0).min(startup_now);
+}
+
+fn startup_fetch_delay(last_ok: Option<i64>, has_usage: bool, time: i64) -> Option<u32> {
+    let age = time - last_ok?;
+    (has_usage && (0..60).contains(&age)).then_some((60 - age) as u32)
+}
+
+fn start_initial_claude_fetches() {
+    let time = now();
+    let accounts = with(|s| {
+        s.accounts
+            .iter()
+            .map(|account| {
+                (
+                    account.id,
+                    startup_fetch_delay(account.last_ok, account.usage.is_some(), time),
+                    s.ctl,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    for (id, delay, ctl) in accounts {
+        if let Some(seconds) = delay {
+            unsafe {
+                SetTimer(ctl, T_FETCH_BASE + id as usize, seconds * 1000, None);
+            }
+        } else {
+            start_fetch(id);
+        }
+    }
+}
 
 fn start_fetch(id: u32) {
     let job = with(|s| {
@@ -536,6 +712,7 @@ fn on_result(res: FetchResult) {
                     .map(|old| (old, Instant::now()));
                 a.usage = Some(u);
                 a.last_ok = Some(now());
+                a.startup_cached = false;
                 a.error = None;
             }
             Err(e) => a.error = Some(e.message()),
@@ -815,7 +992,9 @@ fn ensure_widget() {
                         week: mk(w),
                         fable: None,
                         roll: None,
-                        stale: c.error.is_some() || now() - c.as_of > 21600,
+                        stale: s.codex_startup_cached
+                            || c.error.is_some()
+                            || now() - c.as_of > 21600,
                         pace: [
                             pf.map(|p| p.elapsed_frac as f32),
                             pw.map(|p| p.elapsed_frac as f32),
@@ -872,7 +1051,7 @@ fn ensure_widget() {
                         week: None,
                         fable: None,
                         roll: None,
-                        stale: false,
+                        stale: s.spark_startup_cached,
                         pace: [None; 3],
                         projected: [None; 3],
                         text: [Some(text), None, None],
@@ -1180,7 +1359,7 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                 } else {
                     String::new()
                 },
-                stale: t - reading.as_of > 600,
+                stale: s.accounts[index].startup_cached || t - reading.as_of > 600,
                 loading: s.accounts[index].usage.is_none() && s.accounts[index].fetching,
                 ..Default::default()
             };
@@ -1221,7 +1400,7 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                     .as_deref()
                     .map(title_case)
                     .unwrap_or_default(),
-                stale: t - reading.as_of > 21600,
+                stale: s.codex_startup_cached || t - reading.as_of > 21600,
                 ..Default::default()
             };
             add_flyout_windows(&mut section, reading, t);
@@ -1322,7 +1501,7 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                     .collect(),
             });
             section.error = spark.error.clone();
-            section.stale = t - spark.fetched_at > 30;
+            section.stale = s.spark_startup_cached || t - spark.fetched_at > 30;
             section.spark_samples = s
                 .spark_history
                 .iter()
@@ -1343,11 +1522,61 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
         .chain(s.spark.iter().map(|spark| spark.fetched_at))
         .max()
         .unwrap_or(t);
+    let mut router_readings = claude_readings(s, t);
+    if let Some(codex) = &s.codex {
+        router_readings.push(codex.clone());
+    }
+    let router_readings = router_readings
+        .iter()
+        .map(|reading| {
+            serde_json::json!({
+                "provider": match reading.provider {
+                    providers::Provider::Claude => "claude",
+                    providers::Provider::Codex => "codex",
+                    providers::Provider::Spark => "spark",
+                },
+                "as_of": reading.as_of,
+                "error": reading.error,
+                "windows": reading.windows.iter().map(|window| providers::window_json(window, t, None)).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let router_spark = s.spark.as_ref().map(|spark| {
+        serde_json::json!({
+            "fetched_at": spark.fetched_at,
+            "up": spark.up,
+            "error": spark.error,
+            "endpoints": spark.endpoints
+        })
+    });
+    let verdict = router::verdict(
+        &serde_json::json!({"readings": router_readings, "spark": router_spark}),
+        t,
+    );
+    let (router_pill, router_good) = if s.accounts.iter().any(|account| account.startup_cached)
+        || verdict.claude == router::ProviderStatus::Unknown
+    {
+        (String::new(), false)
+    } else if verdict.claude == router::ProviderStatus::Ok {
+        ("Claude OK".into(), true)
+    } else {
+        (
+            match verdict.recommendation.as_str() {
+                "codex" => "Route: Codex",
+                "spark" => "Route: Spark",
+                _ => "Conserve",
+            }
+            .into(),
+            false,
+        )
+    };
     flyout::Snapshot {
         sections,
         updated: age_copy(t - newest, false),
         show_left: s.card_show_left,
         pulse_alpha: loading_pulse_alpha(),
+        router_pill,
+        router_good,
     }
 }
 
@@ -1647,6 +1876,33 @@ unsafe fn message(text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
     )
 }
 
+unsafe fn show_claude_code_hook_setup() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("taskbar-usage-widget.exe"));
+    let command = serde_json::to_string(&exe.to_string_lossy()).unwrap_or_else(|_| "\"\"".into());
+    let snippet = format!(
+        "{{\"hooks\": {{\n  \"UserPromptSubmit\": [{{\"hooks\": [{{\"type\": \"command\", \"command\": {command}, \"args\": [\"--hook\"], \"timeout\": 5}}]}}],\n  \"SessionStart\": [{{\"matcher\": \"startup|resume\", \"hooks\": [{{\"type\": \"command\", \"command\": {command}, \"args\": [\"--hook\"], \"timeout\": 5}}]}}]\n}}}}"
+    );
+    let copied = Command::new("clip.exe")
+        .stdin(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(snippet.as_bytes())?;
+            }
+            child.wait()
+        })
+        .is_ok_and(|status| status.success());
+    let note = if copied {
+        "Copied to the clipboard. Paste this into Claude Code settings.json:\n\n"
+    } else {
+        "Add this to Claude Code settings.json:\n\n"
+    };
+    message(&(note.to_string() + &snippet), MB_OK | MB_ICONINFORMATION);
+}
+
 /// Asks for a folder with the standard Windows folder picker.
 unsafe fn pick_folder() -> Option<PathBuf> {
     let ctl = with(|s| s.ctl);
@@ -1876,6 +2132,34 @@ struct ProviderResult {
     tokens: Option<tokens::Totals>,
 }
 
+fn retain_reading_on_failure(
+    previous: Option<&providers::Reading>,
+    mut next: providers::Reading,
+) -> providers::Reading {
+    if next.error.is_some() && next.windows.is_empty() {
+        if let Some(previous) = previous.filter(|reading| !reading.windows.is_empty()) {
+            let error = next.error;
+            next = previous.clone();
+            next.error = error;
+        }
+    }
+    next
+}
+
+fn retain_spark_on_failure(
+    previous: Option<&providers::SparkSnapshot>,
+    mut next: providers::SparkSnapshot,
+) -> providers::SparkSnapshot {
+    if next.error.is_some() {
+        if let Some(previous) = previous {
+            let error = next.error;
+            next = previous.clone();
+            next.error = error;
+        }
+    }
+    next
+}
+
 fn start_provider_fetch() {
     let (ctl, host, fake, old_codex, old_sig, due, suppress_auth, tracker, dirs, tokens_due) =
         with(|s| {
@@ -2077,8 +2361,15 @@ fn persist_state(s: &mut State, t: i64) {
     }
 }
 
-fn on_provider_result(r: ProviderResult) {
+fn on_provider_result(mut r: ProviderResult) {
     let spark_notice = with(|s| {
+        r.codex = retain_reading_on_failure(s.codex.as_ref(), r.codex);
+        let codex_fresh = r.codex.error.is_none() && !r.codex.windows.is_empty();
+        r.spark = r
+            .spark
+            .take()
+            .map(|next| retain_spark_on_failure(s.spark.as_ref(), next));
+        let spark_fresh = r.spark.as_ref().is_some_and(|spark| spark.error.is_none());
         for (index, key) in ["5h", "week"].iter().enumerate() {
             let critical = r
                 .codex
@@ -2105,6 +2396,9 @@ fn on_provider_result(r: ProviderResult) {
             s.codex_critical_active[index] = critical;
         }
         s.codex = Some(r.codex);
+        if codex_fresh {
+            s.codex_startup_cached = false;
+        }
         s.codex_sig = r.codex_sig;
         if r.codex_checked {
             let t = now();
@@ -2151,6 +2445,9 @@ fn on_provider_result(r: ProviderResult) {
             s.codex_next_fetch = t + wait as i64;
         }
         s.spark = r.spark;
+        if spark_fresh {
+            s.spark_startup_cached = false;
+        }
         if let Some(tokens) = r.tokens {
             s.token_totals = tokens;
             s.tokens_checked_at = now();
@@ -2846,6 +3143,12 @@ unsafe fn show_menu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_REFRESH, w!("Refresh now"));
     AppendMenuW(menu, MF_STRING, ID_OPEN, w!("Open usage page"));
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_CONNECT_CLAUDE_CODE,
+        w!("Connect to Claude Code..."),
+    );
     // Only when claude-swap was installed at launch.
     let (cswap, running) = with(|s| (s.cswap.clone(), s.cswap_running));
     if cswap.is_some() {
@@ -2907,6 +3210,7 @@ unsafe fn show_menu() {
             remove_account(id - ID_REMOVE_BASE);
         }
         ID_OPEN => open_usage_page(),
+        ID_CONNECT_CLAUDE_CODE => show_claude_code_hook_setup(),
         ID_CSWAP => {
             if let Some(exe) = cswap {
                 run_cswap_switch(exe);
@@ -3511,5 +3815,67 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+#[cfg(test)]
+mod startup_cache_tests {
+    use super::*;
+
+    fn reading(windows: Vec<providers::Window>, error: Option<&str>) -> providers::Reading {
+        providers::Reading {
+            provider: providers::Provider::Codex,
+            account: None,
+            windows,
+            fetched_at: 100,
+            as_of: 100,
+            error: error.map(str::to_owned),
+            plan_type: None,
+            live: true,
+        }
+    }
+
+    #[test]
+    fn recent_cached_claude_fetch_delays_startup_poll() {
+        assert_eq!(startup_fetch_delay(Some(980), true, 1000), Some(40));
+        assert_eq!(startup_fetch_delay(Some(940), true, 1000), None);
+        assert_eq!(startup_fetch_delay(Some(980), false, 1000), None);
+    }
+
+    #[test]
+    fn failed_provider_fetches_retain_last_good_data() {
+        let window = providers::Window {
+            key: "week".into(),
+            label: "Weekly".into(),
+            percent: 42.0,
+            resets_at: Some(500),
+            window_secs: Some(604800),
+            reset_since_last_run: false,
+            card_only: false,
+        };
+        let previous = reading(vec![window], None);
+        let merged =
+            retain_reading_on_failure(Some(&previous), reading(Vec::new(), Some("fetch failed")));
+        assert_eq!(merged.windows.len(), 1);
+        assert_eq!(merged.error.as_deref(), Some("fetch failed"));
+        assert_eq!(merged.as_of, 100);
+
+        let previous_spark = providers::SparkSnapshot {
+            fetched_at: 100,
+            up: true,
+            tok_s: 80.0,
+            ..Default::default()
+        };
+        let merged_spark = retain_spark_on_failure(
+            Some(&previous_spark),
+            providers::SparkSnapshot {
+                fetched_at: 200,
+                error: Some("offline".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(merged_spark.fetched_at, 100);
+        assert_eq!(merged_spark.tok_s, 80.0);
+        assert_eq!(merged_spark.error.as_deref(), Some("offline"));
     }
 }

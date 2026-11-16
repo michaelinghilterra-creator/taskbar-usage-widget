@@ -161,6 +161,11 @@ fn atomic_replace(temporary: &Path, path: &Path) -> std::io::Result<()> {
     }
 }
 
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, bytes).and_then(|_| atomic_replace(&temporary, path))
+}
+
 pub fn dir() -> PathBuf {
     PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_else(|| ".".into()))
         .join("TaskbarUsageWidget")

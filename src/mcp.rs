@@ -59,12 +59,32 @@ pub fn serve<R: BufRead, W: Write>(input: R, mut output: W) -> io::Result<()> {
             Some("tools/list") => ok(id, json!({"tools": tools()})),
             Some("tools/call") => {
                 let name = request["params"]["name"].as_str();
-                if matches!(name, Some("get_usage_headroom" | "get_spark_status")) {
+                if matches!(
+                    name,
+                    Some("get_usage_headroom" | "get_spark_status" | "recommend_worker")
+                ) {
                     let headroom = usage_headroom(now());
-                    let result = if name == Some("get_spark_status") {
-                        headroom["spark"].clone()
-                    } else {
-                        headroom
+                    let result = match name {
+                        Some("get_spark_status") => headroom["spark"].clone(),
+                        Some("recommend_worker") => {
+                            let task_size = request["params"]["arguments"]["task_size"]
+                                .as_str()
+                                .unwrap_or("medium");
+                            let router = &headroom["router"];
+                            let bulk = router["recommendation"].as_str().unwrap_or("conserve");
+                            let claude = crate::router::ProviderStatus::from_str(
+                                router["claude"].as_str().unwrap_or("unknown"),
+                            );
+                            let worker = crate::router::recommend_worker(task_size, claude, bulk);
+                            json!({
+                                "worker": worker,
+                                "reason": router["reason"],
+                                "claude": router["claude"],
+                                "codex": router["codex"],
+                                "spark": router["spark"]
+                            })
+                        }
+                        _ => headroom,
                     };
                     ok(
                         id,
@@ -107,15 +127,33 @@ fn tools() -> Value {
             "name": "get_spark_status",
             "description": "Compact local Spark inference status",
             "inputSchema": schema
+        },
+        {
+            "name": "recommend_worker",
+            "description": "Recommend a worker for a small, medium, or large task",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_size": {
+                        "type": "string",
+                        "enum": ["small", "medium", "large"],
+                        "default": "medium"
+                    }
+                },
+                "additionalProperties": false
+            }
         }
     ])
 }
 
-fn usage_headroom(time: i64) -> Value {
-    let path = crate::storage::dir().join("state.json");
-    let state = fs::read(&path)
+pub fn load_cached_state() -> Option<Value> {
+    fs::read(crate::storage::dir().join("state.json"))
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+}
+
+fn usage_headroom(time: i64) -> Value {
+    let state = load_cached_state();
     let fresh = state
         .as_ref()
         .and_then(|value| value["written_at"].as_i64())
@@ -137,6 +175,14 @@ fn usage_headroom(time: i64) -> Value {
             spark = Some(spark_json(&crate::providers::fetch_spark(&host, time)));
         }
     }
+
+    let router_state = json!({"readings": readings, "spark": spark});
+    let router = crate::router::verdict(&router_state, time);
+    let readings = router_state["readings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let spark = router_state.get("spark").cloned();
 
     let mut claude_number = 0;
     let mut providers = Vec::new();
@@ -193,6 +239,7 @@ fn usage_headroom(time: i64) -> Value {
     json!({
         "providers": providers,
         "spark": spark,
+        "router": router.json(),
         "summary": summary.join("; "),
         "advice": if claude_tight { "claude_tight" } else { "ok" }
     })
@@ -412,6 +459,11 @@ mod tests {
             result[0]["result"]["tools"][0]["name"],
             "get_usage_headroom"
         );
+        assert_eq!(result[0]["result"]["tools"][2]["name"], "recommend_worker");
+        assert_eq!(
+            result[0]["result"]["tools"][2]["inputSchema"]["properties"]["task_size"]["default"],
+            "medium"
+        );
     }
 
     #[test]
@@ -424,6 +476,20 @@ mod tests {
         let body: Value = serde_json::from_str(text).unwrap();
         assert!(body["summary"].is_string());
         assert!(body["advice"].is_string());
+        assert!(body["router"]["recommendation"].is_string());
+    }
+
+    #[test]
+    fn recommend_worker_round_trip() {
+        let result = exchange(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"recommend_worker","arguments":{"task_size":"small"}}}
+"#,
+        );
+        let text = result[0]["result"]["content"][0]["text"].as_str().unwrap();
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert!(body["worker"].is_string());
+        assert!(body["reason"].is_string());
+        assert!(body["claude"].is_string());
     }
 
     #[test]

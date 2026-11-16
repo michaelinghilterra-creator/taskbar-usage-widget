@@ -518,6 +518,8 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
         section.stale = now - spark["fetched_at"].as_i64().unwrap_or(now) > 30;
         sections.push(section);
     }
+    let verdict = crate::router::verdict(state, now);
+    let (router_pill, router_good) = router_pill(&verdict);
     flyout::Snapshot {
         sections,
         updated: format!(
@@ -525,7 +527,25 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
             short_age(now - state["written_at"].as_i64().unwrap_or(now))
         ),
         pulse_alpha: 1.0,
+        router_pill,
+        router_good,
         ..Default::default()
+    }
+}
+
+fn router_pill(verdict: &crate::router::Verdict) -> (String, bool) {
+    use crate::router::ProviderStatus;
+    if verdict.claude == ProviderStatus::Unknown {
+        (String::new(), false)
+    } else if verdict.claude == ProviderStatus::Ok {
+        ("Claude OK".into(), true)
+    } else {
+        let text = match verdict.recommendation.as_str() {
+            "codex" => "Route: Codex",
+            "spark" => "Route: Spark",
+            _ => "Conserve",
+        };
+        (text.into(), false)
     }
 }
 
