@@ -2,14 +2,16 @@
 
 See Claude and Codex quota pace plus live Spark inference status on the Windows taskbar.
 
+A fork of [Claude Usage Widget for Windows Taskbar](https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar) by Abdo Sarmini, extended with Codex limits, local AI servers, a headroom router and an API value view.
+
 <p>
   <img src="docs/screenshot-light.png" alt="Widget on a light taskbar" width="490"><br>
   <img src="docs/screenshot-dark.png" alt="Widget on a dark taskbar" width="490">
 </p>
 
-### ⬇️ [Download ClaudeUsageWidget.exe](https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar/releases/latest/download/ClaudeUsageWidget.exe)
+### ⬇️ [Download taskbar-usage-widget.exe](https://github.com/michaelinghilterra-creator/taskbar-usage-widget/releases/latest/download/taskbar-usage-widget.exe)
 
-One small file (~450 KB). No installer, nothing else to download.
+One small file (about 1 MB). No installer, nothing else to download.
 
 ## Features
 
@@ -80,8 +82,8 @@ Untick **Start with Windows**, click **Exit**, and delete the exe. Settings live
 Needs [Rust](https://rustup.rs/) (MSVC toolchain) and the Windows SDK.
 
 ```
-git clone https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar
-cd claude-usage-widget-for-windows-taskbar
+git clone https://github.com/michaelinghilterra-creator/taskbar-usage-widget
+cd taskbar-usage-widget
 cargo build --release
 ```
 
@@ -91,6 +93,6 @@ Unofficial community project, not affiliated with or endorsed by Anthropic. "Cla
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). The original copyright notice is kept in LICENSE.
 
 Based on [Claude Usage Widget for Windows Taskbar](https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar) by Abdo Sarmini, used under the MIT License.

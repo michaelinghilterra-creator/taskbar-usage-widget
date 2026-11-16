@@ -3,7 +3,7 @@ name = "taskbar-usage-widget"
 version = "1.3.0"
 description = "Claude, Codex and Spark usage in the Windows taskbar"
 license = "MIT"
-repository = "https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar"
+repository = "https://github.com/michaelinghilterra-creator/taskbar-usage-widget"
 edition = "2021"
 
 [dependencies]
