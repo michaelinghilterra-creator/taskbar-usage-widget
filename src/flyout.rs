@@ -16,6 +16,9 @@ pub const WM_OPEN_PROVIDER: u32 = WM_APP + 31;
 pub const WM_DISMISSED: u32 = WM_APP + 32;
 const CLASS: *const u16 = w!("TaskbarUsageFlyout");
 const WM_MOUSE_LEAVE_MSG: u32 = 0x02A3;
+const MIN_WIDTH: f32 = 360.0;
+const MAX_WIDTH: f32 = 560.0;
+const WORK_MARGIN: f32 = 12.0;
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,6 +97,7 @@ struct View {
     snapshot: Snapshot,
     dark: bool,
     dpi: u32,
+    width: i32,
 }
 
 thread_local! {
@@ -243,11 +247,22 @@ unsafe fn show_impl(snapshot: &Snapshot, anchor: RECT, dark: bool, owner: HWND, 
         return;
     }
     let dpi = GetDpiForWindow(owner).max(96);
+    let pinned_rect = if is_pinned() && IsWindowVisible(hwnd) != 0 {
+        let mut rect: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut rect);
+        Some(rect)
+    } else {
+        None
+    };
+    let width = pinned_rect
+        .map(|rect| rect.right - rect.left)
+        .unwrap_or_else(|| desired_width(anchor, dpi));
     VIEW.with(|view| {
         *view.borrow_mut() = Some(View {
             snapshot: snapshot.clone(),
             dark,
             dpi,
+            width,
         });
     });
     let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
@@ -266,8 +281,22 @@ unsafe fn show_impl(snapshot: &Snapshot, anchor: RECT, dark: bool, owner: HWND, 
         0,
         SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
     );
-    let frame = render_with_hover(snapshot, dark, dpi, is_pinned(), HOVER_HIT.with(Cell::get));
-    present(hwnd, position(anchor, frame.0, frame.1), frame);
+    let frame = render_with_hover(
+        snapshot,
+        dark,
+        dpi,
+        is_pinned(),
+        HOVER_HIT.with(Cell::get),
+        width,
+    );
+    let point = pinned_rect.map_or_else(
+        || position(anchor, frame.0, frame.1, dpi),
+        |rect| POINT {
+            x: rect.left,
+            y: rect.top,
+        },
+    );
+    present(hwnd, point, frame);
     if click {
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
@@ -276,32 +305,84 @@ unsafe fn show_impl(snapshot: &Snapshot, anchor: RECT, dark: bool, owner: HWND, 
     }
 }
 
-unsafe fn position(anchor: RECT, width: i32, height: i32) -> POINT {
+unsafe fn monitor_info(anchor: RECT) -> MONITORINFO {
     let monitor = MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST);
     let mut info: MONITORINFO = std::mem::zeroed();
     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     GetMonitorInfoW(monitor, &mut info);
-    let (work, screen) = (info.rcWork, info.rcMonitor);
-    let (mut x, mut y) = (anchor.left, anchor.top - height - 8);
-    if anchor.bottom <= work.top + 4 {
-        y = anchor.bottom + 8;
+    info
+}
+
+unsafe fn desired_width(anchor: RECT, dpi: u32) -> i32 {
+    let info = monitor_info(anchor);
+    let work = info.rcWork;
+    let scale = dpi as f32 / 96.0;
+    let margin = (WORK_MARGIN * scale).round() as i32;
+    let gap = (8.0 * scale).round() as i32;
+    let min = (MIN_WIDTH * scale).round() as i32;
+    let max = (MAX_WIDTH * scale).round() as i32;
+    let horizontal = anchor.right - anchor.left >= anchor.bottom - anchor.top;
+    let available = if horizontal {
+        work.right - margin - anchor.left
     } else if anchor.right <= work.left + 4 {
-        x = anchor.right + 8;
+        work.right - margin - anchor.right - gap
+    } else if anchor.left >= work.right - 4 {
+        anchor.left - gap - work.left - margin
+    } else {
+        work.right - margin - anchor.left
+    };
+    available.clamp(min, max)
+}
+
+unsafe fn position(anchor: RECT, width: i32, height: i32, dpi: u32) -> POINT {
+    let info = monitor_info(anchor);
+    let (work, screen) = (info.rcWork, info.rcMonitor);
+    let scale = dpi as f32 / 96.0;
+    let margin = (WORK_MARGIN * scale).round() as i32;
+    let gap = (8.0 * scale).round() as i32;
+    let horizontal = anchor.right - anchor.left >= anchor.bottom - anchor.top;
+    let available = work.right - margin - anchor.left;
+    let mut x = if horizontal && available > width {
+        work.right - margin - width
+    } else {
+        anchor.left
+    };
+    let mut y = anchor.top - height - gap;
+    if anchor.bottom <= work.top + 4 {
+        y = anchor.bottom + gap;
+    } else if anchor.right <= work.left + 4 {
+        x = anchor.right + gap;
         y = anchor.top;
     } else if anchor.left >= work.right - 4 {
-        x = anchor.left - width - 8;
+        x = anchor.left - width - gap;
         y = anchor.top;
     } else if anchor.top < screen.top + height {
-        y = anchor.bottom + 8;
+        y = anchor.bottom + gap;
     }
+    let right_bound = if horizontal {
+        work.right - margin
+    } else {
+        work.right
+    };
     POINT {
-        x: x.clamp(work.left, (work.right - width).max(work.left)),
+        x: x.clamp(work.left, (right_bound - width).max(work.left)),
         y: y.clamp(work.top, (work.bottom - height).max(work.top)),
     }
 }
 
 pub fn render(snapshot: &Snapshot, dark: bool, dpi: u32, pinned: bool) -> (i32, i32, Vec<u32>) {
-    render_with_hover(snapshot, dark, dpi, pinned, HeaderHit::None)
+    let width = (MIN_WIDTH * dpi as f32 / 96.0).round() as i32;
+    render_at_width(snapshot, dark, dpi, pinned, width)
+}
+
+pub fn render_at_width(
+    snapshot: &Snapshot,
+    dark: bool,
+    dpi: u32,
+    pinned: bool,
+    width: i32,
+) -> (i32, i32, Vec<u32>) {
+    render_with_hover(snapshot, dark, dpi, pinned, HeaderHit::None, width)
 }
 
 fn render_with_hover(
@@ -310,9 +391,9 @@ fn render_with_hover(
     dpi: u32,
     pinned: bool,
     hovered: HeaderHit,
+    width: i32,
 ) -> (i32, i32, Vec<u32>) {
     let scale = dpi as f32 / 96.0;
-    let width = (360.0 * scale).round() as i32;
     let sections: i32 = snapshot.sections.iter().map(section_height).sum();
     let gaps = snapshot.sections.len().saturating_sub(1) as i32 * 15;
     let height = ((16 + 28 + sections + gaps + 16) as f32 * scale).round() as i32;
@@ -1136,6 +1217,7 @@ unsafe fn redraw(hwnd: HWND) {
         view.dpi,
         is_pinned(),
         HOVER_HIT.with(Cell::get),
+        view.width,
     );
     present(
         hwnd,
@@ -1263,6 +1345,7 @@ mod tests {
 
     #[test]
     fn header_hit_testing_maps_controls_and_providers() {
+        let width = MIN_WIDTH as i32;
         let sections = vec![
             Section {
                 provider: ProviderKind::Claude,
@@ -1274,27 +1357,27 @@ mod tests {
             },
         ];
         assert_eq!(
-            header_hit_test(336, 18, 360, 1.0, &sections),
+            header_hit_test(width - 24, 18, width, 1.0, &sections),
             HeaderHit::Close
         );
         assert_eq!(
-            header_hit_test(312, 18, 360, 1.0, &sections),
+            header_hit_test(width - 48, 18, width, 1.0, &sections),
             HeaderHit::Pin
         );
         assert_eq!(
-            header_hit_test(288, 18, 360, 1.0, &sections),
+            header_hit_test(width - 72, 18, width, 1.0, &sections),
             HeaderHit::Refresh
         );
         assert_eq!(
-            header_hit_test(28, 50, 360, 1.0, &sections),
+            header_hit_test(28, 50, width, 1.0, &sections),
             HeaderHit::Provider(ProviderKind::Claude)
         );
         assert_eq!(
-            header_hit_test(28, 171, 360, 1.0, &sections),
+            header_hit_test(28, 171, width, 1.0, &sections),
             HeaderHit::Provider(ProviderKind::Codex)
         );
         assert_eq!(
-            header_hit_test(180, 50, 360, 1.0, &sections),
+            header_hit_test(180, 50, width, 1.0, &sections),
             HeaderHit::None
         );
     }

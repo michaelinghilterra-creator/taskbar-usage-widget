@@ -44,6 +44,12 @@ pub fn run(output: &Path) -> Result<Vec<PathBuf>, String> {
             write_bmp_u32(&path, width, height, &pixels).map_err(|error| error.to_string())?;
             written.push(path);
         }
+        let wide_width = (560.0_f32 * 1.5).round() as i32;
+        let (width, height, pixels) =
+            flyout::render_at_width(&snapshot, dark, 144, false, wide_width);
+        let path = output.join(format!("flyout-{theme}-150-wide.bmp"));
+        write_bmp_u32(&path, width, height, &pixels).map_err(|error| error.to_string())?;
+        written.push(path);
     }
     Ok(written)
 }
