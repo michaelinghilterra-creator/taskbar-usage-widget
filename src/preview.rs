@@ -96,10 +96,20 @@ fn write_flyout_states(path: &Path, dark: bool, now: i64, spark_points: &[f32]) 
                 section.as_of = "6 h old".into();
             }
             flyout::ProviderKind::Spark => {
-                section.error = Some("Down".into());
+                section.error = None;
             }
         }
     }
+    mixed.sections.push(flyout::Section {
+        provider: flyout::ProviderKind::Spark,
+        title: "Offline Lab".into(),
+        chip: "vllm · invented/offline".into(),
+        error: Some("unreachable".into()),
+        spark: Some(flyout::SparkStats::default()),
+        ..Default::default()
+    });
+    mixed.local_status = "Local AI \u{00b7} 1 down".into();
+    mixed.local_status_state = 2;
     let mut empty = flyout::Snapshot {
         updated: "Loading".into(),
         sections: vec![
@@ -237,7 +247,20 @@ fn taskbar_model(state: &Value, dark: bool, now: i64, spark_points: &[f32]) -> r
         .find(|reading| reading["provider"].as_str() == Some("codex"))
         .map(|reading| vec![row_from_windows(&reading["windows"], now)])
         .unwrap_or_default();
-    let spark = state.get("spark").filter(|value| !value.is_null());
+    let spark = state["local_servers"]
+        .as_array()
+        .and_then(|servers| {
+            servers
+                .iter()
+                .filter(|server| server["up"].as_bool().unwrap_or(false))
+                .max_by(|left, right| {
+                    left["tok_s"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                        .total_cmp(&right["tok_s"].as_f64().unwrap_or(0.0))
+                })
+        })
+        .or_else(|| state.get("spark").filter(|value| !value.is_null()));
     let spark_row = spark.map(|value| {
         let down = value["error"].is_string() || !value["up"].as_bool().unwrap_or(false);
         let tok_s = value["tok_s"].as_f64().unwrap_or(0.0);
@@ -451,17 +474,31 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
         }
         sections.push(section);
     }
-    if let Some(spark) = state.get("spark").filter(|value| !value.is_null()) {
+    let local_servers = state["local_servers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| {
+            state
+                .get("spark")
+                .filter(|value| !value.is_null())
+                .cloned()
+                .into_iter()
+                .collect()
+        });
+    for spark in &local_servers {
         let endpoint = spark["endpoints"]
             .as_array()
             .and_then(|items| items.first());
         let mut section = flyout::Section {
             provider: flyout::ProviderKind::Spark,
-            title: "Spark".into(),
-            chip: endpoint
-                .and_then(|value| value["model"].as_str())
-                .unwrap_or_default()
-                .to_owned(),
+            title: spark["name"].as_str().unwrap_or("Local AI").to_owned(),
+            chip: format!(
+                "{} · {}",
+                spark["type"].as_str().unwrap_or("auto"),
+                endpoint
+                    .and_then(|value| value["model"].as_str())
+                    .unwrap_or_default()
+            ),
             ..Default::default()
         };
         let running: i64 = spark["endpoints"]
@@ -479,13 +516,16 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
         let tok_s = spark["tok_s"].as_f64().unwrap_or(0.0);
         section.spark = Some(flyout::SparkStats {
             tok_s,
+            tok_known: !matches!(spark["type"].as_str(), Some("ollama" | "lmstudio")),
             peak: spark_points.iter().copied().fold(tok_s as f32, f32::max) as f64,
             running,
             waiting,
+            running_known: endpoint.is_some_and(|value| value["running"].is_number()),
             kv_pct: endpoint.and_then(|value| value["kv_pct"].as_f64()),
             ttft_ms: endpoint
                 .and_then(|value| value["ttft_ms"].as_f64().or_else(|| value["ttft"].as_f64())),
             gpu_util: spark["gpu_util"].as_f64().unwrap_or(0.0),
+            gpu_known: spark["gpu_util"].is_number(),
             gpu_temp: spark["sys"]["gpu"]["temp"].as_f64(),
             gpu_power: spark["sys"]["gpu"]["power"].as_f64(),
             mem_pct: spark["host"]["mem_pct"]
@@ -494,6 +534,12 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
             swap_pct: spark["host"]["swap_pct"]
                 .as_f64()
                 .or_else(|| spark["sys"]["swap"]["pct"].as_f64()),
+            memory_text: spark["host"]["memory_bytes"]
+                .as_u64()
+                .map(|bytes| format!("{:.1} GB VRAM", bytes as f64 / 1024.0 / 1024.0 / 1024.0)),
+            loaded: endpoint
+                .and_then(|value| value["models"].as_array())
+                .map_or(0, Vec::len),
             aux: spark["aux"]
                 .as_array()
                 .into_iter()
@@ -513,6 +559,21 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
     }
     let verdict = crate::router::verdict(state, now);
     let (router_pill, router_good) = router_pill(&verdict);
+    let down = local_servers
+        .iter()
+        .filter(|server| !server["up"].as_bool().unwrap_or(false) || server["error"].is_string())
+        .count();
+    let busy = local_servers
+        .iter()
+        .filter(|server| server["busy"].as_bool().unwrap_or(false))
+        .count();
+    let (local_status, local_status_state) = if down > 0 {
+        (format!("Local AI \u{00b7} {down} down"), 2)
+    } else if busy > 0 {
+        (format!("Local AI \u{00b7} {busy} busy"), 1)
+    } else {
+        ("Local AI \u{00b7} idle".into(), 0)
+    };
     flyout::Snapshot {
         sections,
         updated: format!(
@@ -522,6 +583,8 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
         pulse_alpha: 1.0,
         router_pill,
         router_good,
+        local_status,
+        local_status_state,
         ..Default::default()
     }
 }
@@ -634,8 +697,8 @@ fn fake_state(now: i64) -> Value {
             {"provider":"codex","as_of":now-300,"plan_type":"plus","windows":[window("5h","5-hour",15.0,18000),window("week","Weekly",9.0,604800)]}
         ],
         "spark": {
-            "fetched_at": now, "up": true, "tok_s": 84.0, "gpu_util": 67.0, "busy": true,
-            "endpoints":[{"model":"local-model","engine":"vllm","running":1,"waiting":0,"kv_pct":22.0,"ttft_ms":41.0}],
+            "name":"Spark", "type":"spark-dash", "fetched_at": now, "up": true, "tok_s": 84.0, "gpu_util": 67.0, "busy": true,
+            "endpoints":[{"model":"invented/spark-model","engine":"spark-dash","running":1,"waiting":0,"kv_pct":22.0,"ttft_ms":41.0}],
             "host":{"mem_pct":46.0,"swap_pct":12.0},
             "sys":{"gpu":{"temp":61.0,"power":205.0}},
             "aux":[
@@ -643,6 +706,22 @@ fn fake_state(now: i64) -> Value {
                 {"name":"Chatterbox TTS","up":true,"running":1,"pending":0}
             ]
         },
+        "local_servers": [
+            {
+                "name":"Spark", "url":"http://gpu-box.local:8000", "type":"spark-dash",
+                "fetched_at":now, "up":true, "tok_s":84.0, "gpu_util":67.0, "busy":true,
+                "endpoints":[{"model":"invented/spark-model","engine":"spark-dash","running":1,"waiting":0,"kv_pct":22.0,"ttft_ms":41.0}],
+                "host":{"mem_pct":46.0,"swap_pct":12.0},
+                "sys":{"gpu":{"temp":61.0,"power":205.0}},
+                "aux":[{"name":"Render","up":true,"running":0,"pending":0},{"name":"Speech","up":true,"running":1,"pending":0}]
+            },
+            {
+                "name":"Ollama", "url":"http://10.0.0.5:11434", "type":"ollama",
+                "fetched_at":now, "up":true, "tok_s":0.0, "busy":false,
+                "endpoints":[{"model":"invented/chat-a","models":["invented/chat-a","invented/chat-b"],"memory_bytes":12884901888u64}],
+                "host":{"memory_bytes":12884901888u64}
+            }
+        ],
         "tokens":{"claude":1200000,"claude_output":84000,"codex":238000,"checked_at":now},
         "value":{
             "claude":{"today_usd":12.0,"week_usd":184.0,"month_usd":640.0,"plan_usd":200.0,"projects":[{"name":"trajecktory","share":0.48},{"name":"taskbar-usage-widget","share":0.30},{"name":"other","share":0.22}]},

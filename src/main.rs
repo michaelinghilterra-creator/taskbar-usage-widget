@@ -67,6 +67,8 @@ const ID_ALERTS: usize = 28;
 const ID_CARD_SHOW_LEFT: usize = 29;
 const ID_CONNECT_CLAUDE_CODE: usize = 30;
 const ID_PLAN_PRICES: usize = 31;
+const ID_LOCAL_BUSYEST: usize = 32;
+const ID_LOCAL_SERVER_BASE: usize = 700;
 const ID_AUTOSTART: usize = 3;
 const ID_EXIT: usize = 4;
 const ID_SHOW_LEFT: usize = 5;
@@ -262,7 +264,11 @@ struct State {
     show_claude: bool,
     show_codex: bool,
     show_spark: bool,
-    spark_host: String,
+    local_configs: Vec<providers::LocalServerConfig>,
+    local_servers: Vec<providers::SparkSnapshot>,
+    local_detected: HashMap<String, providers::LocalServerType>,
+    local_counters: HashMap<String, providers::CounterState>,
+    selected_local: String,
     codex: Option<providers::Reading>,
     codex_startup_cached: bool,
     codex_critical_active: [bool; 2],
@@ -277,6 +283,7 @@ struct State {
     spark: Option<providers::SparkSnapshot>,
     spark_startup_cached: bool,
     spark_history: Vec<(i64, f64, f64)>,
+    local_histories: HashMap<String, Vec<(i64, f64, f64)>>,
     history: Option<storage::History>,
     token_tracker: std::sync::Arc<std::sync::Mutex<tokens::Tracker>>,
     token_totals: tokens::Totals,
@@ -309,11 +316,11 @@ thread_local! {
         dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false, card_show_left: false,
         font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, ring_margin: DEFAULT_RING_MARGIN, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
-        show_claude: true, show_codex: true, show_spark: true, spark_host: String::new(), codex: None, codex_startup_cached: false,
+        show_claude: true, show_codex: true, show_spark: true, local_configs: Vec::new(), local_servers: Vec::new(), local_detected: HashMap::new(), local_counters: HashMap::new(), selected_local: String::new(), codex: None, codex_startup_cached: false,
         codex_critical_active: [false; 2], codex_critical_since: [None; 2],
         codex_sig: Vec::new(), codex_checked_at: 0, codex_next_fetch: 0, codex_fetching: false,
         codex_rate_limited: 0, codex_rejected_mtime: None, codex_auth_retry_at: 0,
-        spark: None, spark_startup_cached: false, spark_history: Vec::new(), history: None,
+        spark: None, spark_startup_cached: false, spark_history: Vec::new(), local_histories: HashMap::new(), history: None,
         token_tracker: std::sync::Arc::new(std::sync::Mutex::new(tokens::Tracker::default())),
         token_totals: tokens::Totals { claude: 0, claude_output: 0, codex: 0 }, tokens_checked_at: 0,
         token_worker_running: false, token_backfill_pending: true,
@@ -457,7 +464,16 @@ fn main() {
             s.show_codex = read_setting("ShowCodex") != Some(0);
             s.show_spark = read_setting("ShowSpark") != Some(0);
             s.alerts = read_setting("Alerts") != Some(0);
-            s.spark_host = read_string_setting("SparkHost").unwrap_or_default();
+            let mut local_text = read_string_setting("LocalServers").unwrap_or_default();
+            if let Some(migrated) = providers::migrate_spark_host(
+                Some(&local_text),
+                read_string_setting("SparkHost").as_deref(),
+            ) {
+                write_string_setting("LocalServers", &migrated);
+                local_text = migrated;
+            }
+            s.local_configs = providers::parse_local_servers(&local_text).unwrap_or_default();
+            s.selected_local = read_string_setting("SelectedLocalServer").unwrap_or_default();
             s.claude_plan_usd = read_string_setting("ClaudePlanUsd")
                 .and_then(|v| v.parse().ok())
                 .filter(|v: &f64| *v > 0.0);
@@ -562,6 +578,12 @@ fn claude_usage_from_reading(reading: &providers::Reading) -> Option<api::Usage>
 
 fn stored_spark(value: &serde_json::Value) -> Option<providers::SparkSnapshot> {
     (!value.is_null()).then(|| providers::SparkSnapshot {
+        name: value["name"].as_str().unwrap_or("Spark").to_owned(),
+        engine: value["type"]
+            .as_str()
+            .or_else(|| value["engine"].as_str())
+            .unwrap_or("spark-dash")
+            .to_owned(),
         fetched_at: value["fetched_at"].as_i64().unwrap_or(0),
         up: value["up"].as_bool().unwrap_or(false),
         tok_s: value["tok_s"].as_f64().unwrap_or(0.0),
@@ -573,6 +595,37 @@ fn stored_spark(value: &serde_json::Value) -> Option<providers::SparkSnapshot> {
         aux: value["aux"].as_array().cloned().unwrap_or_default(),
         error: value["error"].as_str().map(str::to_owned),
     })
+}
+
+fn local_running(server: &providers::SparkSnapshot) -> i64 {
+    server
+        .endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint["running"].as_i64())
+        .sum()
+}
+
+fn choose_local_server<'a>(
+    servers: &'a [providers::SparkSnapshot],
+    selected: &str,
+) -> Option<&'a providers::SparkSnapshot> {
+    if !selected.is_empty() {
+        if let Some(server) = servers.iter().find(|server| server.name == selected) {
+            return Some(server);
+        }
+    }
+    servers
+        .iter()
+        .enumerate()
+        .filter(|(_, server)| server.up && server.error.is_none())
+        .max_by(|(left_index, left), (right_index, right)| {
+            left.tok_s
+                .total_cmp(&right.tok_s)
+                .then_with(|| local_running(left).cmp(&local_running(right)))
+                .then_with(|| right_index.cmp(left_index))
+        })
+        .map(|(_, server)| server)
+        .or_else(|| servers.first())
 }
 
 fn seed_from_state(s: &mut State, state: &serde_json::Value, startup_now: i64) {
@@ -608,8 +661,25 @@ fn seed_from_state(s: &mut State, state: &serde_json::Value, startup_now: i64) {
         s.codex = Some(reading);
         s.codex_startup_cached = true;
     }
-    if !s.spark_host.is_empty() {
-        if let Some(spark) = state.get("spark").and_then(stored_spark) {
+    if !s.local_configs.is_empty() {
+        s.local_servers = state["local_servers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(stored_spark)
+            .collect();
+        if s.local_servers.is_empty() {
+            if let Some(spark) = state.get("spark").and_then(stored_spark) {
+                s.local_servers.push(spark);
+            }
+        }
+        if let Some(spark) = choose_local_server(&s.local_servers, &s.selected_local).cloned() {
+            for server in &s.local_servers {
+                s.local_histories
+                    .entry(server.name.clone())
+                    .or_default()
+                    .push((server.fetched_at, server.tok_s, server.gpu_util));
+            }
             s.spark_history
                 .push((spark.fetched_at, spark.tok_s, spark.gpu_util));
             s.spark = Some(spark);
@@ -983,7 +1053,7 @@ fn ensure_widget() {
                             .map(critical_pulse_alpha)
                             .fold(1.0, f32::min)
                     } * 100.0) as u8,
-                    (if !s.spark_host.is_empty() && s.spark.is_none() {
+                    (if !s.local_configs.is_empty() && s.spark.is_none() {
                         loading_pulse_alpha()
                     } else {
                         1.0
@@ -1079,7 +1149,7 @@ fn ensure_widget() {
                     }
                 })
                 .or_else(|| {
-                    (!s.spark_host.is_empty()).then(|| render::Row {
+                    (!s.local_configs.is_empty()).then(|| render::Row {
                         five: None,
                         week: None,
                         fable: None,
@@ -1118,7 +1188,7 @@ fn ensure_widget() {
                 spark_row,
                 show_claude: s.show_claude,
                 show_codex: s.show_codex,
-                show_spark: s.show_spark && !s.spark_host.is_empty(),
+                show_spark: s.show_spark && !s.local_configs.is_empty(),
                 spark_samples: s
                     .spark_history
                     .iter()
@@ -1338,7 +1408,7 @@ fn tooltip_text(s: &State) -> String {
             out += "\nLoading...";
         }
     }
-    if s.show_spark && !s.spark_host.is_empty() {
+    if s.show_spark && !s.local_configs.is_empty() {
         out += "\n\nSpark";
         if let Some(sp) = &s.spark {
             if let Some(e) = &sp.error {
@@ -1364,9 +1434,34 @@ fn json_is_active(value: &serde_json::Value) -> bool {
         || value.as_u64().is_some_and(|count| count > 0)
 }
 
+fn local_status(s: &State) -> (String, u8) {
+    if s.local_configs.is_empty() {
+        return (String::new(), 0);
+    }
+    let title = if s.local_configs.len() == 1 {
+        s.local_configs[0].name.as_str()
+    } else {
+        "Local AI"
+    };
+    let down = s
+        .local_servers
+        .iter()
+        .filter(|server| !server.up || server.error.is_some())
+        .count();
+    let busy = s.local_servers.iter().filter(|server| server.busy).count();
+    if down > 0 {
+        (format!("{title} \u{00b7} {down} down"), 2)
+    } else if busy > 0 {
+        (format!("{title} \u{00b7} {busy} busy"), 1)
+    } else {
+        (format!("{title} \u{00b7} idle"), 0)
+    }
+}
+
 fn flyout_snapshot(s: &State) -> flyout::Snapshot {
     let t = now();
     let mut sections = Vec::new();
+    let (local_status, local_status_state) = local_status(s);
     if s.show_claude {
         for (index, reading) in claude_readings(s, t).into_iter().enumerate() {
             let mut section = flyout::Section {
@@ -1453,17 +1548,21 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
         }
     }
     if s.show_spark {
-        let mut section = flyout::Section {
-            provider: flyout::ProviderKind::Spark,
-            title: "Spark".into(),
-            ..Default::default()
-        };
-        if let Some(spark) = &s.spark {
+        for spark in &s.local_servers {
+            let mut section = flyout::Section {
+                provider: flyout::ProviderKind::Spark,
+                title: spark.name.clone(),
+                ..Default::default()
+            };
             let endpoint = spark.endpoints.first();
-            section.chip = endpoint
+            let model = endpoint
                 .and_then(|value| value["model"].as_str())
-                .unwrap_or_default()
-                .to_owned();
+                .unwrap_or_default();
+            section.chip = if model.is_empty() {
+                spark.engine.clone()
+            } else {
+                format!("{} · {model}", spark.engine)
+            };
             let running: i64 = spark
                 .endpoints
                 .iter()
@@ -1474,20 +1573,24 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                 .iter()
                 .filter_map(|value| value["waiting"].as_i64())
                 .sum();
-            let peak = s
-                .spark_history
-                .iter()
+            let server_history = s.local_histories.get(&spark.name);
+            let peak = server_history
+                .into_iter()
+                .flatten()
                 .map(|sample| sample.1)
                 .fold(0.0f64, f64::max);
             section.spark = Some(flyout::SparkStats {
                 tok_s: spark.tok_s,
+                tok_known: !matches!(spark.engine.as_str(), "ollama" | "lmstudio" | "auto"),
                 peak,
                 running,
                 waiting,
+                running_known: endpoint.is_some_and(|value| value["running"].is_number()),
                 kv_pct: endpoint.and_then(|value| value["kv_pct"].as_f64()),
                 ttft_ms: endpoint
                     .and_then(|value| value["ttft_ms"].as_f64().or_else(|| value["ttft"].as_f64())),
                 gpu_util: spark.gpu_util,
+                gpu_known: spark.sys["gpu"]["util"].is_number() || spark.gpu_util > 0.0,
                 gpu_temp: spark.sys["gpu"]["temp"].as_f64(),
                 gpu_power: spark.sys["gpu"]["power"].as_f64(),
                 mem_pct: spark.host["mem_pct"]
@@ -1496,6 +1599,12 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                 swap_pct: spark.host["swap_pct"]
                     .as_f64()
                     .or_else(|| spark.sys["swap"]["pct"].as_f64()),
+                memory_text: spark.host["memory_bytes"]
+                    .as_u64()
+                    .map(|bytes| format!("{:.1} GB VRAM", bytes as f64 / 1024.0 / 1024.0 / 1024.0)),
+                loaded: endpoint
+                    .and_then(|value| value["models"].as_array())
+                    .map_or(0, Vec::len),
                 aux: spark
                     .aux
                     .iter()
@@ -1516,17 +1625,24 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
             });
             section.error = spark.error.clone();
             section.stale = s.spark_startup_cached || t - spark.fetched_at > 30;
-            section.spark_samples = s
-                .spark_history
-                .iter()
+            section.spark_samples = server_history
+                .into_iter()
+                .flatten()
                 .map(|sample| (sample.0, sample.1))
                 .collect();
             section.chart_end = t;
-        } else {
-            section.loading = !s.spark_host.is_empty();
-            section.empty = s.spark_host.is_empty();
+            sections.push(section);
         }
-        sections.push(section);
+        if s.local_servers.is_empty() {
+            let mut section = flyout::Section {
+                provider: flyout::ProviderKind::Spark,
+                title: "Local AI".into(),
+                ..Default::default()
+            };
+            section.loading = !s.local_configs.is_empty();
+            section.empty = s.local_configs.is_empty();
+            sections.push(section);
+        }
     }
     let newest = s
         .accounts
@@ -1563,8 +1679,22 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
             "endpoints": spark.endpoints
         })
     });
+    let router_locals = s
+        .local_servers
+        .iter()
+        .map(|server| {
+            serde_json::json!({
+                "name": server.name,
+                "fetched_at": server.fetched_at,
+                "up": server.up,
+                "error": server.error,
+                "running": local_running(server),
+                "endpoints": server.endpoints
+            })
+        })
+        .collect::<Vec<_>>();
     let verdict = router::verdict(
-        &serde_json::json!({"readings": router_readings, "spark": router_spark}),
+        &serde_json::json!({"readings": router_readings, "spark": router_spark, "local_servers": router_locals}),
         t,
     );
     let (router_pill, router_good) = if s.accounts.iter().any(|account| account.startup_cached)
@@ -1577,6 +1707,18 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
         (
             match verdict.recommendation.as_str() {
                 "codex" => "Route: Codex",
+                value if value.starts_with("local:") => {
+                    return flyout::Snapshot {
+                        sections,
+                        updated: age_copy(t - newest, false),
+                        show_left: s.card_show_left,
+                        pulse_alpha: loading_pulse_alpha(),
+                        router_pill: format!("Route: {}", value.trim_start_matches("local:")),
+                        router_good: false,
+                        local_status,
+                        local_status_state,
+                    };
+                }
                 "spark" => "Route: Spark",
                 _ => "Conserve",
             }
@@ -1591,6 +1733,8 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
         pulse_alpha: loading_pulse_alpha(),
         router_pill,
         router_good,
+        local_status,
+        local_status_state,
     }
 }
 
@@ -2193,7 +2337,9 @@ struct ProviderResult {
     codex_checked: bool,
     codex_status: Option<providers::CodexFetchStatus>,
     codex_auth_mtime: Option<i64>,
-    spark: Option<providers::SparkSnapshot>,
+    local_servers: Vec<providers::SparkSnapshot>,
+    local_detected: HashMap<String, providers::LocalServerType>,
+    local_counters: HashMap<String, providers::CounterState>,
 }
 
 struct TokenResult {
@@ -2230,26 +2376,31 @@ fn retain_spark_on_failure(
 }
 
 fn start_provider_fetch() {
-    let (ctl, host, fake, old_codex, old_sig, due, suppress_auth) = with(|s| {
-        let auth_mtime = providers::codex_auth_mtime();
-        let auth_changed = s.codex_rejected_mtime.is_some() && auth_mtime != s.codex_rejected_mtime;
-        let due = !s.codex_fetching && (now() >= s.codex_next_fetch || auth_changed);
-        if due {
-            s.codex_fetching = true;
-        }
-        let suppress_auth = (now() < s.codex_auth_retry_at && auth_mtime == s.codex_rejected_mtime)
-            .then_some(auth_mtime)
-            .flatten();
-        (
-            s.ctl as isize,
-            s.spark_host.clone(),
-            s.fake_data,
-            s.codex.clone(),
-            s.codex_sig.clone(),
-            due,
-            suppress_auth,
-        )
-    });
+    let (ctl, configs, mut detected, mut counters, fake, old_codex, old_sig, due, suppress_auth) =
+        with(|s| {
+            let auth_mtime = providers::codex_auth_mtime();
+            let auth_changed =
+                s.codex_rejected_mtime.is_some() && auth_mtime != s.codex_rejected_mtime;
+            let due = !s.codex_fetching && (now() >= s.codex_next_fetch || auth_changed);
+            if due {
+                s.codex_fetching = true;
+            }
+            let suppress_auth = (now() < s.codex_auth_retry_at
+                && auth_mtime == s.codex_rejected_mtime)
+                .then_some(auth_mtime)
+                .flatten();
+            (
+                s.ctl as isize,
+                s.local_configs.clone(),
+                s.local_detected.clone(),
+                s.local_counters.clone(),
+                s.fake_data,
+                s.codex.clone(),
+                s.codex_sig.clone(),
+                due,
+                suppress_auth,
+            )
+        });
     std::thread::spawn(move || {
         let t = now();
         let signature = providers::codex_files_signature();
@@ -2307,15 +2458,46 @@ fn start_provider_fetch() {
             let fetched = providers::fetch_codex(t, suppress_auth);
             (fetched.reading, Some(fetched.status), fetched.auth_mtime)
         };
-        let spark = if host.is_empty() {
-            None
-        } else if fake {
-            Some(providers::parse_spark(
-                &serde_json::json!({"endpoints":[{"name":"dev","model":"local","engine":"dev","up":true,"tok_s":142.0,"running":1}],"sys":{"gpu":{"util":72.0}}}),
-                t,
-            ))
+        let local_servers = if fake {
+            configs
+                .iter()
+                .map(|config| {
+                    let mut snapshot = providers::parse_spark(
+                        &serde_json::json!({"endpoints":[{"name":"dev","model":"invented/model","engine":"dev","up":true,"tok_s":142.0,"running":1}],"sys":{"gpu":{"util":72.0}}}),
+                        t,
+                    );
+                    snapshot.name = config.name.clone();
+                    snapshot
+                })
+                .collect()
         } else {
-            Some(providers::fetch_spark(&host, t))
+            let jobs = configs
+                .iter()
+                .cloned()
+                .map(|config| {
+                    let mut server_detected = detected.get(&config.name).copied();
+                    let mut server_counters = counters.remove(&config.name).unwrap_or_default();
+                    std::thread::spawn(move || {
+                        let snapshot = providers::fetch_local_server(
+                            &config,
+                            t,
+                            &mut server_detected,
+                            &mut server_counters,
+                        );
+                        (config.name, snapshot, server_detected, server_counters)
+                    })
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .filter_map(|job| job.join().ok())
+                .map(|(name, snapshot, server_detected, server_counters)| {
+                    if let Some(engine) = server_detected {
+                        detected.insert(name.clone(), engine);
+                    }
+                    counters.insert(name, server_counters);
+                    snapshot
+                })
+                .collect()
         };
         let msg = Box::new(ProviderResult {
             codex,
@@ -2323,7 +2505,9 @@ fn start_provider_fetch() {
             codex_checked: due,
             codex_status,
             codex_auth_mtime,
-            spark,
+            local_servers,
+            local_detected: detected,
+            local_counters: counters,
         });
         unsafe {
             PostMessageW(
@@ -2465,10 +2649,10 @@ fn persist_state(s: &mut State, t: i64) {
         readings.push(c.clone());
     }
     if let Some(history) = &mut s.history {
-        let _ = history.append(&readings, s.spark.as_ref(), t);
+        let _ = history.append(&readings, &s.local_servers, t);
         let _ = storage::write_state(
             &readings,
-            s.spark.as_ref(),
+            &s.local_servers,
             history,
             t,
             (
@@ -2485,11 +2669,11 @@ fn on_provider_result(mut r: ProviderResult) {
     let spark_notice = with(|s| {
         r.codex = retain_reading_on_failure(s.codex.as_ref(), r.codex);
         let codex_fresh = r.codex.error.is_none() && !r.codex.windows.is_empty();
-        r.spark = r
-            .spark
-            .take()
-            .map(|next| retain_spark_on_failure(s.spark.as_ref(), next));
-        let spark_fresh = r.spark.as_ref().is_some_and(|spark| spark.error.is_none());
+        for next in &mut r.local_servers {
+            let previous = s.local_servers.iter().find(|old| old.name == next.name);
+            *next = retain_spark_on_failure(previous, next.clone());
+        }
+        let spark_fresh = r.local_servers.iter().any(|server| server.error.is_none());
         for (index, key) in ["5h", "week"].iter().enumerate() {
             let critical = r
                 .codex
@@ -2564,7 +2748,10 @@ fn on_provider_result(mut r: ProviderResult) {
             }
             s.codex_next_fetch = t + wait as i64;
         }
-        s.spark = r.spark;
+        s.local_servers = r.local_servers;
+        s.local_detected = r.local_detected;
+        s.local_counters = r.local_counters;
+        s.spark = choose_local_server(&s.local_servers, &s.selected_local).cloned();
         if spark_fresh {
             s.spark_startup_cached = false;
         }
@@ -2573,6 +2760,11 @@ fn on_provider_result(mut r: ProviderResult) {
         }
         let cutoff = now() - 600;
         s.spark_history.retain(|x| x.0 >= cutoff);
+        for server in &s.local_servers {
+            let history = s.local_histories.entry(server.name.clone()).or_default();
+            history.push((server.fetched_at, server.tok_s, server.gpu_util));
+            history.retain(|sample| sample.0 >= cutoff);
+        }
         persist_state(s, now());
         s.rendered = None;
         spark_alert(s)
@@ -2965,13 +3157,20 @@ unsafe extern "system" fn spark_dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, _:
             1
         }
         WM_COMMAND if (wp & 0xffff) as usize == IDOK as usize => {
-            let mut b = [0u16; 512];
+            let mut b = [0u16; 4096];
             let n = GetDlgItemTextW(hwnd, 100, b.as_mut_ptr(), b.len() as i32);
             let s = String::from_utf16_lossy(&b[..n as usize])
                 .trim()
-                .trim_start_matches("http://")
-                .trim_end_matches('/')
                 .to_string();
+            if let Err(error) = providers::parse_local_servers(&s) {
+                MessageBoxW(
+                    hwnd,
+                    wide(&error).as_ptr(),
+                    w!("Invalid local server list"),
+                    MB_OK | MB_ICONWARNING,
+                );
+                return 1;
+            }
             SPARK_DIALOG.with(|x| x.borrow_mut().1 = Some(s));
             EndDialog(hwnd, IDOK as isize);
             1
@@ -2989,7 +3188,20 @@ unsafe extern "system" fn spark_dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, _:
 }
 
 fn prompt_spark_address() -> Option<String> {
-    let current = with(|s| s.spark_host.clone());
+    let current = with(|s| {
+        s.local_configs
+            .iter()
+            .map(|server| {
+                format!(
+                    "{} {} {}",
+                    server.name,
+                    server.url,
+                    server.server_type.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    });
     SPARK_DIALOG.with(|x| *x.borrow_mut() = (current, None));
     let mut v = Vec::<u16>::new();
     let d = |v: &mut Vec<u16>, x: u32| {
@@ -3005,9 +3217,9 @@ fn prompt_spark_address() -> Option<String> {
         (WS_POPUP | WS_CAPTION | WS_SYSMENU) as u32 | DS_MODALFRAME as u32,
     );
     d(&mut v, 0);
-    v.extend([4, 10, 10, 210, 70]);
+    v.extend([4, 10, 10, 260, 132]);
     v.extend([0, 0]);
-    z(&mut v, "Spark address");
+    z(&mut v, "Local AI servers");
     let item = |v: &mut Vec<u16>,
                 style: u32,
                 x: u16,
@@ -3031,19 +3243,21 @@ fn prompt_spark_address() -> Option<String> {
         (WS_CHILD | WS_VISIBLE) as u32,
         8,
         8,
-        194,
+        244,
         10,
         101,
         0x0082,
-        "Host or host:port",
+        "One per line: name http://host:port [type]. # comments allowed.",
     );
     item(
         &mut v,
-        (WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP) as u32 | ES_AUTOHSCROLL as u32,
+        (WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WS_VSCROLL) as u32
+            | ES_MULTILINE as u32
+            | ES_AUTOVSCROLL as u32,
         8,
         21,
-        194,
-        14,
+        244,
+        72,
         100,
         0x0081,
         "",
@@ -3051,8 +3265,8 @@ fn prompt_spark_address() -> Option<String> {
     item(
         &mut v,
         (WS_CHILD | WS_VISIBLE | WS_TABSTOP) as u32 | BS_DEFPUSHBUTTON as u32,
-        92,
-        45,
+        142,
+        104,
         52,
         14,
         IDOK as u16,
@@ -3062,8 +3276,8 @@ fn prompt_spark_address() -> Option<String> {
     item(
         &mut v,
         (WS_CHILD | WS_VISIBLE | WS_TABSTOP) as u32,
-        150,
-        45,
+        200,
+        104,
         52,
         14,
         IDCANCEL as u16,
@@ -3237,9 +3451,49 @@ unsafe fn show_menu() {
         w!("Show Claude"),
     );
     AppendMenuW(menu, tick(ID_SHOW_CODEX), ID_SHOW_CODEX, w!("Show Codex"));
-    AppendMenuW(menu, tick(ID_SHOW_SPARK), ID_SHOW_SPARK, w!("Show Spark"));
+    AppendMenuW(
+        menu,
+        tick(ID_SHOW_SPARK),
+        ID_SHOW_SPARK,
+        w!("Show local AI"),
+    );
+    let local_menu = CreatePopupMenu();
+    let (selected_local, local_names) = with(|s| {
+        (
+            s.selected_local.clone(),
+            s.local_configs
+                .iter()
+                .map(|server| server.name.clone())
+                .collect::<Vec<_>>(),
+        )
+    });
+    AppendMenuW(
+        local_menu,
+        MF_STRING
+            | if selected_local.is_empty() {
+                MF_CHECKED
+            } else {
+                0
+            },
+        ID_LOCAL_BUSYEST,
+        w!("Busiest"),
+    );
+    for (index, name) in local_names.iter().enumerate() {
+        AppendMenuW(
+            local_menu,
+            MF_STRING
+                | if selected_local == *name {
+                    MF_CHECKED
+                } else {
+                    0
+                },
+            ID_LOCAL_SERVER_BASE + index,
+            wide(&name.replace('&', "&&")).as_ptr(),
+        );
+    }
+    AppendMenuW(menu, MF_POPUP, local_menu as usize, w!("Show in taskbar"));
     AppendMenuW(menu, tick(ID_ALERTS), ID_ALERTS, w!("Alerts"));
-    AppendMenuW(menu, MF_STRING, ID_SPARK_ADDRESS, w!("Spark address..."));
+    AppendMenuW(menu, MF_STRING, ID_SPARK_ADDRESS, w!("Local AI servers..."));
     AppendMenuW(menu, MF_STRING, ID_PLAN_PRICES, w!("Plan prices..."));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_POPUP, sub as usize, w!("Update every"));
@@ -3478,14 +3732,37 @@ unsafe fn show_menu() {
             start_token_slice();
         }
         ID_SPARK_ADDRESS => {
-            if let Some(host) = prompt_spark_address() {
+            if let Some(text) = prompt_spark_address() {
+                let configs = providers::parse_local_servers(&text).unwrap_or_default();
+                let registry = providers::local_servers_registry(&configs);
                 with(|s| {
-                    s.spark_host = host.clone();
+                    s.local_configs = configs;
+                    s.local_servers.clear();
+                    s.spark = None;
                     s.rendered = None;
                 });
-                write_string_setting("SparkHost", &host);
+                write_string_setting("LocalServers", &registry);
                 start_provider_fetch();
             }
+        }
+        ID_LOCAL_BUSYEST => {
+            with(|s| {
+                s.selected_local.clear();
+                s.spark = choose_local_server(&s.local_servers, "").cloned();
+                s.rendered = None;
+            });
+            write_string_setting("SelectedLocalServer", "");
+            ensure_widget();
+        }
+        id if (ID_LOCAL_SERVER_BASE..ID_LOCAL_SERVER_BASE + local_names.len()).contains(&id) => {
+            let name = local_names[id - ID_LOCAL_SERVER_BASE].clone();
+            with(|s| {
+                s.selected_local = name.clone();
+                s.spark = choose_local_server(&s.local_servers, &name).cloned();
+                s.rendered = None;
+            });
+            write_string_setting("SelectedLocalServer", &name);
+            ensure_widget();
         }
         ID_PLAN_PRICES => {
             if let Some((claude, codex)) = prompt_plan_prices() {
@@ -3878,7 +4155,7 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                             || s.codex_critical_since.iter().any(Option::is_some)
                             || s.accounts.iter().any(|a| a.usage.is_none() && a.fetching)
                             || s.codex_checked_at == 0
-                            || (!s.spark_host.is_empty() && s.spark.is_none())
+                            || (!s.local_configs.is_empty() && s.spark.is_none())
                     });
                     if !animating {
                         KillTimer(hwnd, T_ROLL);
@@ -4019,9 +4296,21 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     open_url("https://chatgpt.com/codex/settings/usage");
                 }
                 value if value == flyout::ProviderKind::Spark as usize => {
-                    let host = with(|state| state.spark_host.clone());
-                    if !host.is_empty() {
-                        open_url(&format!("http://{host}/"));
+                    let url = with(|state| {
+                        state
+                            .local_configs
+                            .iter()
+                            .find(|server| {
+                                state
+                                    .spark
+                                    .as_ref()
+                                    .is_some_and(|spark| spark.name == server.name)
+                            })
+                            .or_else(|| state.local_configs.first())
+                            .map(|server| server.url.clone())
+                    });
+                    if let Some(url) = url {
+                        open_url(&url);
                     }
                 }
                 _ => {}

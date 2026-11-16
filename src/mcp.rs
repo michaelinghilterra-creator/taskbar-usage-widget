@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+#[cfg(not(test))]
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
@@ -61,11 +62,17 @@ pub fn serve<R: BufRead, W: Write>(input: R, mut output: W) -> io::Result<()> {
                 let name = request["params"]["name"].as_str();
                 if matches!(
                     name,
-                    Some("get_usage_headroom" | "get_spark_status" | "recommend_worker")
+                    Some(
+                        "get_usage_headroom"
+                            | "get_spark_status"
+                            | "get_local_servers"
+                            | "recommend_worker"
+                    )
                 ) {
                     let headroom = usage_headroom(now());
                     let result = match name {
                         Some("get_spark_status") => headroom["spark"].clone(),
+                        Some("get_local_servers") => headroom["local_servers"].clone(),
                         Some("recommend_worker") => {
                             let task_size = request["params"]["arguments"]["task_size"]
                                 .as_str()
@@ -125,7 +132,12 @@ fn tools() -> Value {
         },
         {
             "name": "get_spark_status",
-            "description": "Compact local Spark inference status",
+            "description": "Compatibility view of the first local AI server",
+            "inputSchema": schema.clone()
+        },
+        {
+            "name": "get_local_servers",
+            "description": "Compact status for every configured local AI server",
             "inputSchema": schema
         },
         {
@@ -170,6 +182,11 @@ fn usage_headroom(time: i64) -> Value {
         .and_then(|value| value["readings"].as_array())
         .cloned()
         .unwrap_or_default();
+    let mut local_servers = state
+        .as_ref()
+        .and_then(|value| value["local_servers"].as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut spark = state.as_ref().and_then(|value| value.get("spark")).cloned();
 
     if !fresh {
@@ -178,18 +195,38 @@ fn usage_headroom(time: i64) -> Value {
             reading["error"] = json!("unavailable: widget state is stale");
         }
         readings.push(reading_json(&crate::providers::read_codex(time), time));
-        if let Some(host) = spark_host() {
-            spark = Some(spark_json(&crate::providers::fetch_spark(&host, time)));
+        if let Some(config_text) = read_registry_string("LocalServers") {
+            if let Ok(configs) = crate::providers::parse_local_servers(&config_text) {
+                local_servers = configs
+                    .iter()
+                    .map(|config| {
+                        let mut detected = None;
+                        let mut counters = Default::default();
+                        spark_json(&crate::providers::fetch_local_server(
+                            config,
+                            time,
+                            &mut detected,
+                            &mut counters,
+                        ))
+                    })
+                    .collect();
+                spark = local_servers.first().cloned();
+            }
         }
     }
 
-    let router_state = json!({"readings": readings, "spark": spark});
+    let router_state =
+        json!({"readings": readings, "spark": spark, "local_servers": local_servers});
     let router = crate::router::verdict(&router_state, time);
     let readings = router_state["readings"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     let spark = router_state.get("spark").cloned();
+    let local_servers = router_state["local_servers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
 
     let mut claude_number = 0;
     let mut providers = Vec::new();
@@ -242,10 +279,15 @@ fn usage_headroom(time: i64) -> Value {
         });
         compact
     });
+    let local_servers = local_servers
+        .iter()
+        .map(|value| compact_spark(value, time))
+        .collect::<Vec<_>>();
 
     json!({
         "providers": providers,
         "spark": spark,
+        "local_servers": local_servers,
         "router": router.json(),
         "summary": summary.join("; "),
         "advice": if claude_tight { "claude_tight" } else { "ok" },
@@ -327,6 +369,11 @@ fn read_registry_string(setting: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+fn read_registry_string(_: &str) -> Option<String> {
+    None
+}
+
 fn normalize_window(window: &Value, time: i64, stale: i64) -> Value {
     let used = window["percent"].as_f64().unwrap_or(0.0);
     let elapsed = window["elapsed_pct"].as_f64().unwrap_or(0.0);
@@ -362,6 +409,8 @@ fn reading_json(reading: &crate::providers::Reading, time: i64) -> Value {
 
 fn spark_json(spark: &crate::providers::SparkSnapshot) -> Value {
     json!({
+        "name": spark.name,
+        "type": spark.engine,
         "fetched_at": spark.fetched_at,
         "up": spark.up,
         "model": spark.endpoints.first().and_then(|e| e["model"].as_str()),
@@ -399,13 +448,16 @@ fn compact_spark(value: &Value, time: i64) -> Value {
         })
         .collect::<Vec<_>>();
     json!({
+        "name": value["name"],
+        "type": value["type"],
         "up": value["up"].as_bool().unwrap_or(false),
         "model": first.map_or(Value::Null, |endpoint| endpoint["model"].clone()),
         "engine": first.map_or(Value::Null, |endpoint| endpoint["engine"].clone()),
         "tok_s": value["tok_s"].as_f64().unwrap_or(0.0),
-        "peak_20m": spark_peak_20m(time).max(value["tok_s"].as_f64().unwrap_or(0.0)),
-        "running": sum("running"),
-        "waiting": sum("waiting"),
+        "peak_20m": server_peak_20m(time, value["name"].as_str().unwrap_or_default())
+            .max(value["tok_s"].as_f64().unwrap_or(0.0)),
+        "running": value["running"].as_i64().unwrap_or_else(|| sum("running")),
+        "waiting": value["waiting"].as_i64().unwrap_or_else(|| sum("waiting")),
         "kv_pct": first.map_or(Value::Null, |endpoint| endpoint["kv_pct"].clone()),
         "ttft_ms": first.map_or(Value::Null, |endpoint| {
             endpoint.get("ttft_ms").or_else(|| endpoint.get("ttft")).cloned().unwrap_or(Value::Null)
@@ -422,7 +474,10 @@ fn compact_spark(value: &Value, time: i64) -> Value {
     })
 }
 
-fn spark_peak_20m(time: i64) -> f64 {
+/// Highest tok/s in the last 20 minutes for one local server, from its own
+/// `local:<name>` history lines.
+fn server_peak_20m(time: i64, name: &str) -> f64 {
+    let key = format!("local:{name}");
     let path = crate::storage::dir().join("history.jsonl");
     fs::read_to_string(path)
         .ok()
@@ -430,50 +485,11 @@ fn spark_peak_20m(time: i64) -> f64 {
         .flat_map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
         .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
         .filter(|entry| {
-            entry["p"].as_str() == Some("spark")
+            entry["p"].as_str() == Some(key.as_str())
                 && entry["t"].as_i64().is_some_and(|at| at >= time - 1200)
         })
         .filter_map(|entry| entry["tok"].as_f64())
         .fold(0.0, f64::max)
-}
-
-fn spark_host() -> Option<String> {
-    let key = crate::http::wide("Software\\TaskbarUsageWidget");
-    let name = crate::http::wide("SparkHost");
-    let mut size = 0;
-    unsafe {
-        if RegGetValueW(
-            HKEY_CURRENT_USER,
-            key.as_ptr(),
-            name.as_ptr(),
-            RRF_RT_REG_SZ,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        ) != 0
-        {
-            return None;
-        }
-        let mut value = vec![0u16; size as usize / 2 + 1];
-        if RegGetValueW(
-            HKEY_CURRENT_USER,
-            key.as_ptr(),
-            name.as_ptr(),
-            RRF_RT_REG_SZ,
-            std::ptr::null_mut(),
-            value.as_mut_ptr().cast(),
-            &mut size,
-        ) != 0
-        {
-            return None;
-        }
-        let end = value
-            .iter()
-            .position(|character| *character == 0)
-            .unwrap_or(value.len());
-        let host = String::from_utf16_lossy(&value[..end]);
-        (!host.is_empty()).then_some(host)
-    }
 }
 
 fn iso_local(unix: i64) -> String {
@@ -541,9 +557,10 @@ mod tests {
             result[0]["result"]["tools"][0]["name"],
             "get_usage_headroom"
         );
-        assert_eq!(result[0]["result"]["tools"][2]["name"], "recommend_worker");
+        assert_eq!(result[0]["result"]["tools"][2]["name"], "get_local_servers");
+        assert_eq!(result[0]["result"]["tools"][3]["name"], "recommend_worker");
         assert_eq!(
-            result[0]["result"]["tools"][2]["inputSchema"]["properties"]["task_size"]["default"],
+            result[0]["result"]["tools"][3]["inputSchema"]["properties"]["task_size"]["default"],
             "medium"
         );
     }
@@ -599,6 +616,8 @@ mod tests {
         let compact = compact_spark(&source, 1000);
         let object = compact.as_object().unwrap();
         let expected = [
+            "name",
+            "type",
             "up",
             "model",
             "engine",

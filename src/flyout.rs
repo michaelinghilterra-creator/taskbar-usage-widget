@@ -65,16 +65,21 @@ pub struct AuxStatus {
 #[derive(Clone, Default, PartialEq)]
 pub struct SparkStats {
     pub tok_s: f64,
+    pub tok_known: bool,
     pub peak: f64,
     pub running: i64,
     pub waiting: i64,
+    pub running_known: bool,
     pub kv_pct: Option<f64>,
     pub ttft_ms: Option<f64>,
     pub gpu_util: f64,
+    pub gpu_known: bool,
     pub gpu_temp: Option<f64>,
     pub gpu_power: Option<f64>,
     pub mem_pct: Option<f64>,
     pub swap_pct: Option<f64>,
+    pub memory_text: Option<String>,
+    pub loaded: usize,
     pub aux: Vec<AuxStatus>,
 }
 
@@ -123,6 +128,8 @@ pub struct Snapshot {
     pub pulse_alpha: f32,
     pub router_pill: String,
     pub router_good: bool,
+    pub local_status: String,
+    pub local_status_state: u8,
 }
 
 #[allow(dead_code)]
@@ -710,17 +717,17 @@ fn status_pill(section: &Section) -> (String, PillState) {
     }
     if section.provider == ProviderKind::Spark {
         if section.error.is_some() {
-            return ("Spark \u{00b7} Down".into(), PillState::Crit);
+            return (format!("{} \u{00b7} Down", section.title), PillState::Crit);
         }
         if let Some(stats) = &section.spark {
             if stats.tok_s > 0.0 {
                 return (
-                    format!("Spark {dot} {:.0} t/s", stats.tok_s),
+                    format!("{} {dot} {:.0} t/s", section.title, stats.tok_s),
                     PillState::Spark,
                 );
             }
         }
-        return ("Spark \u{00b7} Idle".into(), PillState::Idle);
+        return (format!("{} \u{00b7} Idle", section.title), PillState::Idle);
     }
     if section.stale {
         let age = section.as_of.trim_end_matches(" old");
@@ -758,7 +765,13 @@ fn panel_height(section: &Section) -> f32 {
         };
         count as f32 * 44.0 + count.saturating_sub(1) as f32 * 12.0
     } else if section.provider == ProviderKind::Spark {
-        133.0
+        if section.error.is_some() {
+            45.0
+        } else if section.spark.as_ref().is_some_and(|stats| !stats.tok_known) {
+            100.0
+        } else {
+            133.0
+        }
     } else {
         let count = section.bars.len().max(1);
         count as f32 * 53.0
@@ -803,8 +816,28 @@ unsafe fn card_layout(snapshot: &Snapshot, width: i32, scale: f32) -> CardLayout
     let mut x = content_left + s(4.0);
     let mut y = s(41.0);
     let pill_right = content_right - s(4.0);
+    let mut local_pill_added = false;
     for section in &snapshot.sections {
-        let (text, state) = status_pill(section);
+        if section.provider == ProviderKind::Spark && local_pill_added {
+            continue;
+        }
+        let (text, state) =
+            if section.provider == ProviderKind::Spark && !snapshot.local_status.is_empty() {
+                local_pill_added = true;
+                (
+                    snapshot.local_status.clone(),
+                    match snapshot.local_status_state {
+                        2 => PillState::Crit,
+                        1 => PillState::Spark,
+                        _ => PillState::Idle,
+                    },
+                )
+            } else {
+                if section.provider == ProviderKind::Spark {
+                    local_pill_added = true;
+                }
+                status_pill(section)
+            };
         let width = s(7.0 + 6.0 + 6.0 + 9.0 + 3.0) + text_width(dc, &text);
         if x + width > pill_right && x > content_left + s(4.0) {
             x = content_left + s(4.0);
@@ -1811,10 +1844,12 @@ unsafe fn draw_e2_spark(
     let down = section.error.is_some();
     let value = if down {
         "down".to_owned()
+    } else if !stats.tok_known {
+        "idle".to_owned()
     } else {
         format!("{:.0}", stats.tok_s)
     };
-    let show_running = stats.running > 0 && right - left >= s(420.0);
+    let show_running = stats.running_known && stats.running > 0 && right - left >= s(420.0);
     let hero_width = s(if show_running { 190.0 } else { 116.0 });
     SelectObject(dc, f30b);
     draw_text_rect(
@@ -1832,13 +1867,17 @@ unsafe fn draw_e2_spark(
     SelectObject(dc, f11);
     let sub = if down {
         "unreachable \u{00b7} 4 m".to_owned()
-    } else {
+    } else if stats.tok_known {
         let running = if show_running {
             format!(" \u{00b7} {} running", stats.running)
         } else {
             String::new()
         };
         format!("tok/s \u{00b7} peak {:.0}{running}", stats.peak)
+    } else if stats.loaded > 0 {
+        format!("{} models loaded", stats.loaded)
+    } else {
+        "idle".into()
     };
     draw_text_rect(
         dc,
@@ -1852,6 +1891,9 @@ unsafe fn draw_e2_spark(
         palette.muted,
         DT_LEFT,
     );
+    if down {
+        return;
+    }
     let chart_left = (left + hero_width + s(4.0)).min(right - s(50.0));
     let buckets = crate::render::bucket_samples(&section.spark_samples, section.chart_end, 600, 30);
     let chart_rect = RECT {
@@ -1860,7 +1902,7 @@ unsafe fn draw_e2_spark(
         right,
         bottom: top + s(38.0),
     };
-    if buckets.filled_buckets < 3 {
+    if !stats.tok_known || buckets.filled_buckets < 3 {
         draw_line(
             dc,
             chart_rect.left,
@@ -1897,26 +1939,37 @@ unsafe fn draw_e2_spark(
     );
     let row_top = stats_top + s(9.0);
     let gap = s(8.0);
-    let column_width = (right - left - gap * 3) / 4;
-    let columns = [
-        ("KV cache", percent(stats.kv_pct), String::new()),
-        ("TTFT", unit(stats.ttft_ms, "ms"), String::new()),
-        (
+    let mut columns = Vec::new();
+    if down || stats.kv_pct.is_some() {
+        columns.push(("KV cache", percent(stats.kv_pct), String::new()));
+    }
+    if down || stats.ttft_ms.is_some() {
+        columns.push(("TTFT", unit(stats.ttft_ms, "ms"), String::new()));
+    }
+    if down || stats.gpu_known {
+        columns.push((
             "GPU",
             format!("{:.0}%", stats.gpu_util),
             match (stats.gpu_temp, stats.gpu_power) {
                 (Some(temp), Some(power)) => format!("{temp:.0} \u{00b0}C \u{00b7} {power:.0} W"),
                 _ => String::new(),
             },
-        ),
-        (
+        ));
+    }
+    if down || stats.mem_pct.is_some() || stats.memory_text.is_some() {
+        columns.push((
             "Memory",
-            percent(stats.mem_pct),
+            stats
+                .memory_text
+                .clone()
+                .unwrap_or_else(|| percent(stats.mem_pct)),
             stats
                 .swap_pct
                 .map_or_else(String::new, |value| format!("swap {value:.0}%")),
-        ),
-    ];
+        ));
+    }
+    let column_width =
+        (right - left - gap * columns.len().saturating_sub(1) as i32) / columns.len().max(1) as i32;
     for (index, (label, value, sub)) in columns.iter().enumerate() {
         let x = left + index as i32 * (column_width + gap);
         SelectObject(dc, f10);

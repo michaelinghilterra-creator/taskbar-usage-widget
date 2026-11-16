@@ -41,9 +41,11 @@ impl History {
             let Some(time) = entry["t"].as_i64() else {
                 continue;
             };
-            if provider == "spark" {
-                self.last
-                    .insert("spark".into(), (entry["tok"].as_f64().unwrap_or(0.0), time));
+            if provider == "spark" || provider.starts_with("local:") {
+                self.last.insert(
+                    provider.into(),
+                    (entry["tok"].as_f64().unwrap_or(0.0), time),
+                );
             } else if let (Some(key), Some(value)) = (entry["k"].as_str(), entry["v"].as_f64()) {
                 self.last.insert(format!("{provider}:{key}"), (value, time));
             }
@@ -68,7 +70,7 @@ impl History {
     pub fn append(
         &mut self,
         readings: &[Reading],
-        spark: Option<&SparkSnapshot>,
+        local_servers: &[SparkSnapshot],
         now: i64,
     ) -> Result<(), String> {
         let mut new_entries = Vec::new();
@@ -91,19 +93,20 @@ impl History {
                 }
             }
         }
-        if let Some(spark) = spark {
+        for spark in local_servers {
+            let history_key = format!("local:{}", spark.name);
             let due = self
                 .last
-                .get("spark")
+                .get(&history_key)
                 .is_none_or(|(_, time)| now - *time >= 60);
             if due {
                 new_entries.push(json!({
                     "t": now,
-                    "p": "spark",
+                    "p": history_key,
                     "tok": spark.tok_s,
                     "gpu": spark.gpu_util
                 }));
-                self.last.insert("spark".into(), (spark.tok_s, now));
+                self.last.insert(history_key, (spark.tok_s, now));
             }
         }
         if new_entries.is_empty() {
@@ -189,7 +192,7 @@ fn provider_name(provider: providers::Provider) -> &'static str {
 
 pub fn write_state(
     readings: &[Reading],
-    spark: Option<&SparkSnapshot>,
+    local_servers: &[SparkSnapshot],
     history: &History,
     now: i64,
     tokens: (u64, u64, u64),
@@ -221,8 +224,10 @@ pub fn write_state(
             })
         })
         .collect();
-    let spark_json = spark.map(|spark| {
+    let server_json = |spark: &SparkSnapshot| {
         json!({
+            "name": spark.name,
+            "type": spark.engine,
             "fetched_at": spark.fetched_at,
             "up": spark.up,
             "tok_s": spark.tok_s,
@@ -234,11 +239,14 @@ pub fn write_state(
             "aux": spark.aux,
             "error": spark.error
         })
-    });
+    };
+    let local_servers_json = local_servers.iter().map(server_json).collect::<Vec<_>>();
+    let spark_json = local_servers.first().map(server_json);
     let bytes = serde_json::to_vec(&json!({
         "written_at": now,
         "readings": readings_json,
         "spark": spark_json,
+        "local_servers": local_servers_json,
         "tokens": {
             "claude": tokens.0,
             "claude_output": tokens.1,

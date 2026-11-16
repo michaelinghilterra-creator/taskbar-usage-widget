@@ -607,8 +607,129 @@ pub fn parse_codex_line(value: &Value, now: i64, fallback_as_of: i64) -> Option<
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LocalServerType {
+    #[default]
+    Auto,
+    SparkDash,
+    Sglang,
+    Vllm,
+    Llamacpp,
+    Ollama,
+    Lmstudio,
+}
+
+impl LocalServerType {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "spark-dash" => Self::SparkDash,
+            "sglang" => Self::Sglang,
+            "vllm" => Self::Vllm,
+            "llamacpp" => Self::Llamacpp,
+            "ollama" => Self::Ollama,
+            "lmstudio" => Self::Lmstudio,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SparkDash => "spark-dash",
+            Self::Sglang => "sglang",
+            Self::Vllm => "vllm",
+            Self::Llamacpp => "llamacpp",
+            Self::Ollama => "ollama",
+            Self::Lmstudio => "lmstudio",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalServerConfig {
+    pub name: String,
+    pub url: String,
+    pub server_type: LocalServerType,
+}
+
+pub fn parse_local_servers(text: &str) -> Result<Vec<LocalServerConfig>, String> {
+    let mut servers = Vec::new();
+    for (index, source) in text.lines().enumerate() {
+        let line = source.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields = if line.contains('|') {
+            line.split('|').map(str::trim).collect::<Vec<_>>()
+        } else {
+            line.split_whitespace().collect::<Vec<_>>()
+        };
+        if !(2..=3).contains(&fields.len()) {
+            return Err(format!("Line {}: expected name url [type]", index + 1));
+        }
+        let name = fields[0];
+        let url = fields[1].trim_end_matches('/');
+        if name.is_empty() || name.contains('|') {
+            return Err(format!("Line {}: invalid name", index + 1));
+        }
+        let Some((host, _, path, secure)) = split_http_url(url) else {
+            return Err(format!("Line {}: URL must be http://host:port", index + 1));
+        };
+        if secure || host.is_empty() || path != "/" {
+            return Err(format!("Line {}: URL must be HTTP with no path", index + 1));
+        }
+        let server_type = fields
+            .get(2)
+            .map_or(Some(LocalServerType::Auto), |value| {
+                LocalServerType::parse(value)
+            })
+            .ok_or_else(|| format!("Line {}: unknown server type", index + 1))?;
+        servers.push(LocalServerConfig {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            server_type,
+        });
+    }
+    Ok(servers)
+}
+
+pub fn local_servers_registry(servers: &[LocalServerConfig]) -> String {
+    servers
+        .iter()
+        .map(|server| {
+            format!(
+                "{}|{}|{}",
+                server.name,
+                server.url,
+                server.server_type.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn migrate_spark_host(local_servers: Option<&str>, spark_host: Option<&str>) -> Option<String> {
+    if local_servers.is_some_and(|value| !value.trim().is_empty()) {
+        return None;
+    }
+    spark_host
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(|host| format!("Spark|http://{}|auto", host.trim_end_matches('/')))
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CounterState {
+    pub tokens: Option<(f64, i64)>,
+    pub ttft_sum: Option<(f64, i64)>,
+    pub ttft_count: Option<(f64, i64)>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SparkSnapshot {
+    pub name: String,
+    pub engine: String,
     pub fetched_at: i64,
     pub up: bool,
     pub tok_s: f64,
@@ -619,6 +740,158 @@ pub struct SparkSnapshot {
     pub host: Value,
     pub aux: Vec<Value>,
     pub error: Option<String>,
+}
+
+fn prometheus_metrics(text: &str) -> std::collections::HashMap<String, f64> {
+    let mut metrics = std::collections::HashMap::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(raw_name) = fields.next() else {
+            continue;
+        };
+        let Some(value) = fields.next().and_then(|value| value.parse::<f64>().ok()) else {
+            continue;
+        };
+        let name = raw_name.split('{').next().unwrap_or(raw_name);
+        *metrics.entry(name.to_owned()).or_insert(0.0) += value;
+    }
+    metrics
+}
+
+fn counter_rate(previous: &mut Option<(f64, i64)>, current: f64, now: i64) -> f64 {
+    let rate = previous
+        .and_then(|(old, at)| {
+            (current >= old && now > at).then_some((current - old) / (now - at) as f64)
+        })
+        .unwrap_or(0.0);
+    *previous = Some((current, now));
+    rate
+}
+
+pub fn parse_prometheus(
+    name: &str,
+    server_type: LocalServerType,
+    text: &str,
+    models: Vec<String>,
+    now: i64,
+    counters: &mut CounterState,
+) -> SparkSnapshot {
+    let metrics = prometheus_metrics(text);
+    let get = |key: &str| metrics.get(key).copied();
+    let (running, waiting, token_counter, throughput, kv, ttft_sum, ttft_count) = match server_type
+    {
+        LocalServerType::Sglang => (
+            get("sglang:num_running_reqs"),
+            get("sglang:num_queue_reqs"),
+            get("sglang:generation_tokens_total"),
+            get("sglang:gen_throughput"),
+            get("sglang:token_usage"),
+            get("sglang:time_to_first_token_seconds_sum"),
+            get("sglang:time_to_first_token_seconds_count"),
+        ),
+        LocalServerType::Vllm => (
+            get("vllm:num_requests_running"),
+            get("vllm:num_requests_waiting"),
+            get("vllm:generation_tokens_total"),
+            None,
+            get("vllm:kv_cache_usage_perc").or_else(|| get("vllm:gpu_cache_usage_perc")),
+            get("vllm:time_to_first_token_seconds_sum"),
+            get("vllm:time_to_first_token_seconds_count"),
+        ),
+        LocalServerType::Llamacpp => (
+            get("llamacpp:requests_processing"),
+            get("llamacpp:requests_deferred"),
+            get("llamacpp:tokens_predicted_total"),
+            None,
+            get("llamacpp:kv_cache_usage_ratio"),
+            None,
+            None,
+        ),
+        _ => (None, None, None, None, None, None, None),
+    };
+    let tok_s = throughput.unwrap_or_else(|| {
+        token_counter.map_or(0.0, |value| counter_rate(&mut counters.tokens, value, now))
+    });
+    let ttft_ms = match (ttft_sum, ttft_count) {
+        (Some(sum), Some(count)) => {
+            let old_sum = counters.ttft_sum;
+            let old_count = counters.ttft_count;
+            counters.ttft_sum = Some((sum, now));
+            counters.ttft_count = Some((count, now));
+            match (old_sum, old_count) {
+                (Some((prior_sum, _)), Some((prior_count, _)))
+                    if sum >= prior_sum && count > prior_count =>
+                {
+                    Some((sum - prior_sum) / (count - prior_count) * 1000.0)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let running_value = running.unwrap_or(0.0).round() as i64;
+    let endpoint = json!({
+        "model": models.first(),
+        "models": models,
+        "engine": server_type.as_str(),
+        "running": running.map(|value| value.round() as i64),
+        "waiting": waiting.map(|value| value.round() as i64),
+        "kv_pct": kv.map(|value| value * 100.0),
+        "ttft_ms": ttft_ms
+    });
+    SparkSnapshot {
+        name: name.to_owned(),
+        engine: server_type.as_str().to_owned(),
+        fetched_at: now,
+        up: true,
+        tok_s,
+        busy: running_value > 0 || tok_s > 1.0,
+        endpoints: vec![endpoint],
+        ..Default::default()
+    }
+}
+
+pub fn parse_ollama(name: &str, value: &Value, now: i64) -> SparkSnapshot {
+    let models = value["models"].as_array().cloned().unwrap_or_default();
+    let names = models
+        .iter()
+        .filter_map(|model| model["name"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let memory = models
+        .iter()
+        .filter_map(|model| model["size_vram"].as_u64())
+        .sum::<u64>();
+    SparkSnapshot {
+        name: name.to_owned(),
+        engine: "ollama".into(),
+        fetched_at: now,
+        up: true,
+        endpoints: vec![json!({"model": names.first(), "models": names, "memory_bytes": memory})],
+        host: json!({"memory_bytes": memory}),
+        ..Default::default()
+    }
+}
+
+pub fn parse_models(name: &str, engine: LocalServerType, value: &Value, now: i64) -> SparkSnapshot {
+    let models = value["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    SparkSnapshot {
+        name: name.to_owned(),
+        engine: engine.as_str().to_owned(),
+        fetched_at: now,
+        up: true,
+        endpoints: vec![
+            json!({"model": models.first(), "models": models, "engine": engine.as_str()}),
+        ],
+        ..Default::default()
+    }
 }
 
 pub fn parse_spark(value: &Value, now: i64) -> SparkSnapshot {
@@ -637,11 +910,13 @@ pub fn parse_spark(value: &Value, now: i64) -> SparkSnapshot {
         .iter()
         .any(|endpoint| endpoint["up"].as_bool().unwrap_or(false));
     SparkSnapshot {
+        name: "Spark".into(),
+        engine: "spark-dash".into(),
         fetched_at: now,
         up,
         tok_s,
         gpu_util,
-        busy: running > 0 || gpu_util > 30.0,
+        busy: running > 0 || tok_s > 1.0 || gpu_util > 30.0,
         endpoints,
         sys: value["sys"].clone(),
         host: value["host"].clone(),
@@ -650,34 +925,170 @@ pub fn parse_spark(value: &Value, now: i64) -> SparkSnapshot {
     }
 }
 
-pub fn fetch_spark(host: &str, now: i64) -> SparkSnapshot {
-    match crate::http::request_to(
+fn local_request(config: &LocalServerConfig, path: &str) -> Result<crate::http::Response, String> {
+    let Some((host, port, _, secure)) = split_http_url(&config.url) else {
+        return Err("Invalid local server URL".into());
+    };
+    crate::http::request_to(
         "GET",
-        host,
-        80,
-        "/api/stats",
-        "Accept: application/json",
+        &host,
+        port,
+        path,
+        "Accept: application/json, text/plain",
         None,
-        false,
+        secure,
         2500,
-    ) {
-        Ok(response) if response.status == 200 => serde_json::from_slice::<Value>(&response.body)
-            .map(|value| parse_spark(&value, now))
-            .unwrap_or_else(|_| SparkSnapshot {
+    )
+}
+
+fn response_json(response: crate::http::Response) -> Option<Value> {
+    (response.status == 200)
+        .then(|| serde_json::from_slice(&response.body).ok())
+        .flatten()
+}
+
+fn fetch_models(config: &LocalServerConfig) -> Vec<String> {
+    local_request(config, "/v1/models")
+        .ok()
+        .and_then(response_json)
+        .map(|value| {
+            value["data"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|model| model["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn detect_prometheus_type(text: &str) -> Option<LocalServerType> {
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("sglang:"))
+    {
+        Some(LocalServerType::Sglang)
+    } else if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("vllm:"))
+    {
+        Some(LocalServerType::Vllm)
+    } else if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("llamacpp:"))
+    {
+        Some(LocalServerType::Llamacpp)
+    } else {
+        None
+    }
+}
+
+pub fn fetch_local_server(
+    config: &LocalServerConfig,
+    now: i64,
+    detected: &mut Option<LocalServerType>,
+    counters: &mut CounterState,
+) -> SparkSnapshot {
+    let requested = detected.unwrap_or(config.server_type);
+    let result = (|| -> Result<(SparkSnapshot, LocalServerType), String> {
+        if matches!(
+            requested,
+            LocalServerType::Auto | LocalServerType::SparkDash
+        ) {
+            if let Ok(response) = local_request(config, "/api/stats") {
+                if let Some(value) = response_json(response) {
+                    if value["endpoints"].is_array() {
+                        let mut snapshot = parse_spark(&value, now);
+                        snapshot.name = config.name.clone();
+                        return Ok((snapshot, LocalServerType::SparkDash));
+                    }
+                }
+            }
+            if requested == LocalServerType::SparkDash {
+                return Err("spark-dash /api/stats unavailable".into());
+            }
+        }
+        if matches!(
+            requested,
+            LocalServerType::Auto
+                | LocalServerType::Sglang
+                | LocalServerType::Vllm
+                | LocalServerType::Llamacpp
+        ) {
+            if let Ok(response) = local_request(config, "/metrics") {
+                if response.status == 200 {
+                    let text = String::from_utf8_lossy(&response.body);
+                    let engine = if requested == LocalServerType::Auto {
+                        detect_prometheus_type(&text)
+                    } else {
+                        Some(requested)
+                    };
+                    if let Some(engine) = engine {
+                        return Ok((
+                            parse_prometheus(
+                                &config.name,
+                                engine,
+                                &text,
+                                fetch_models(config),
+                                now,
+                                counters,
+                            ),
+                            engine,
+                        ));
+                    }
+                }
+            }
+            if requested != LocalServerType::Auto {
+                return Err(format!("{} /metrics unavailable", requested.as_str()));
+            }
+        }
+        if matches!(requested, LocalServerType::Auto | LocalServerType::Ollama) {
+            let version = local_request(config, "/api/version").ok();
+            if version.is_some_and(|response| response.status == 200) {
+                if let Some(value) = local_request(config, "/api/ps")
+                    .ok()
+                    .and_then(response_json)
+                {
+                    return Ok((
+                        parse_ollama(&config.name, &value, now),
+                        LocalServerType::Ollama,
+                    ));
+                }
+            }
+            if requested == LocalServerType::Ollama {
+                return Err("ollama API unavailable".into());
+            }
+        }
+        if matches!(requested, LocalServerType::Auto | LocalServerType::Lmstudio) {
+            if let Some(value) = local_request(config, "/v1/models")
+                .ok()
+                .and_then(response_json)
+            {
+                return Ok((
+                    parse_models(&config.name, LocalServerType::Lmstudio, &value, now),
+                    LocalServerType::Lmstudio,
+                ));
+            }
+        }
+        Err("No supported local AI API detected".into())
+    })();
+    match result {
+        Ok((snapshot, engine)) => {
+            *detected = Some(engine);
+            snapshot
+        }
+        Err(error) => {
+            if config.server_type == LocalServerType::Auto && detected.take().is_some() {
+                return fetch_local_server(config, now, detected, counters);
+            }
+            SparkSnapshot {
+                name: config.name.clone(),
+                engine: detected.unwrap_or(config.server_type).as_str().to_owned(),
                 fetched_at: now,
-                error: Some("Bad Spark response".into()),
+                error: Some(error),
                 ..Default::default()
-            }),
-        Ok(response) => SparkSnapshot {
-            fetched_at: now,
-            error: Some(format!("Spark HTTP {}", response.status)),
-            ..Default::default()
-        },
-        Err(error) => SparkSnapshot {
-            fetched_at: now,
-            error: Some(error),
-            ..Default::default()
-        },
+            }
+        }
     }
 }
 
@@ -863,5 +1274,121 @@ mod tests {
         let spark = parse_spark(&json!({"endpoints":[{"up":true,"tok_s":2.5}]}), 1);
         assert_eq!(spark.tok_s, 2.5);
         assert_eq!(spark.gpu_util, 0.0);
+    }
+
+    #[test]
+    fn local_server_lines_and_migration() {
+        let servers = parse_local_servers(
+            "# lab\nFast http://gpu-box.local:8000 sglang\nChat|http://10.0.0.5:11434|ollama",
+        )
+        .unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].server_type, LocalServerType::Sglang);
+        assert_eq!(servers[1].name, "Chat");
+        assert!(parse_local_servers("bad https://gpu-box.local:8000 auto").is_err());
+        assert_eq!(
+            migrate_spark_host(None, Some("gpu-box.local:8000")).as_deref(),
+            Some("Spark|http://gpu-box.local:8000|auto")
+        );
+        assert_eq!(
+            migrate_spark_host(
+                Some("Lab|http://gpu-box.local:8000|auto"),
+                Some("10.0.0.5:11434")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn prometheus_sums_label_sets_and_maps_sglang() {
+        let text = r#"
+# HELP ignored
+sglang:num_running_reqs{model="a"} 1
+sglang:num_running_reqs{model="b"} 2
+sglang:num_queue_reqs 4
+sglang:gen_throughput 126.5
+sglang:token_usage 0.42
+"#;
+        let snapshot = parse_prometheus(
+            "Fast",
+            LocalServerType::Sglang,
+            text,
+            vec!["invented/model".into()],
+            10,
+            &mut CounterState::default(),
+        );
+        assert_eq!(snapshot.endpoints[0]["running"], 3);
+        assert_eq!(snapshot.endpoints[0]["waiting"], 4);
+        assert_eq!(snapshot.tok_s, 126.5);
+        assert_eq!(snapshot.endpoints[0]["kv_pct"], 42.0);
+    }
+
+    #[test]
+    fn vllm_counter_reset_and_ttft_delta() {
+        let mut counters = CounterState::default();
+        let first = "vllm:num_requests_running 0\nvllm:num_requests_waiting 1\nvllm:generation_tokens_total 100\nvllm:gpu_cache_usage_perc 0.25\nvllm:time_to_first_token_seconds_sum 2\nvllm:time_to_first_token_seconds_count 4";
+        let second = "vllm:num_requests_running 2\nvllm:num_requests_waiting 0\nvllm:generation_tokens_total 160\nvllm:gpu_cache_usage_perc 0.5\nvllm:time_to_first_token_seconds_sum 3.2\nvllm:time_to_first_token_seconds_count 6";
+        assert_eq!(
+            parse_prometheus("V", LocalServerType::Vllm, first, vec![], 10, &mut counters).tok_s,
+            0.0
+        );
+        let snapshot = parse_prometheus(
+            "V",
+            LocalServerType::Vllm,
+            second,
+            vec![],
+            20,
+            &mut counters,
+        );
+        assert_eq!(snapshot.tok_s, 6.0);
+        assert!((snapshot.endpoints[0]["ttft_ms"].as_f64().unwrap() - 600.0).abs() < 0.001);
+        let reset = parse_prometheus(
+            "V",
+            LocalServerType::Vllm,
+            "vllm:generation_tokens_total 3",
+            vec![],
+            30,
+            &mut counters,
+        );
+        assert_eq!(reset.tok_s, 0.0);
+    }
+
+    #[test]
+    fn llamacpp_mapping_and_ollama_ps() {
+        let snapshot = parse_prometheus(
+            "Cpp",
+            LocalServerType::Llamacpp,
+            "llamacpp:requests_processing 1\nllamacpp:requests_deferred 2\nllamacpp:kv_cache_usage_ratio 0.75",
+            vec![],
+            1,
+            &mut CounterState::default(),
+        );
+        assert_eq!(snapshot.endpoints[0]["running"], 1);
+        assert_eq!(snapshot.endpoints[0]["waiting"], 2);
+        assert_eq!(snapshot.endpoints[0]["kv_pct"], 75.0);
+        let ollama = parse_ollama(
+            "Chat",
+            &json!({"models":[{"name":"invented/a","size_vram":100},{"name":"invented/b","size_vram":250}]}),
+            2,
+        );
+        assert_eq!(ollama.endpoints[0]["models"].as_array().unwrap().len(), 2);
+        assert_eq!(ollama.host["memory_bytes"], 350);
+        assert!(!ollama.busy);
+    }
+
+    #[test]
+    fn auto_detection_order_helpers() {
+        assert_eq!(
+            detect_prometheus_type("vllm:x 1\nsglang:y 2"),
+            Some(LocalServerType::Sglang)
+        );
+        assert_eq!(
+            detect_prometheus_type("vllm:x 1\nllamacpp:y 2"),
+            Some(LocalServerType::Vllm)
+        );
+        assert_eq!(
+            detect_prometheus_type("llamacpp:x 1"),
+            Some(LocalServerType::Llamacpp)
+        );
     }
 }

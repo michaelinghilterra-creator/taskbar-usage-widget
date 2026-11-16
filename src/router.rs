@@ -72,15 +72,16 @@ pub fn recommend_worker(
     task_size: &str,
     claude: ProviderStatus,
     bulk_recommendation: &str,
-) -> &'static str {
+) -> String {
     if task_size == "small" && claude != ProviderStatus::Out {
-        "claude"
+        "claude".into()
     } else {
         match bulk_recommendation {
-            "claude" => "claude",
-            "codex" => "codex",
-            "spark" => "spark",
-            _ => "conserve",
+            "claude" => "claude".into(),
+            "codex" => "codex".into(),
+            value if value.starts_with("local:") => value.into(),
+            "spark" => "spark".into(),
+            _ => "conserve".into(),
         }
     }
 }
@@ -97,20 +98,64 @@ pub fn verdict(state: &Value, now: i64) -> Verdict {
         .collect::<Vec<_>>();
     let (claude, claude_reason) = provider_status(&claude_readings, "Claude", 1800, now);
     let (codex, codex_reason) = provider_status(&codex_readings, "Codex", 21600, now);
-    let spark = spark_status(state.get("spark"), now);
+    let local_servers = state["local_servers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| {
+            state
+                .get("spark")
+                .filter(|value| !value.is_null())
+                .cloned()
+                .into_iter()
+                .collect()
+        });
+    let local = local_servers
+        .iter()
+        .map(|server| {
+            (
+                server["name"].as_str().unwrap_or("Spark").to_owned(),
+                spark_status(Some(server), now),
+            )
+        })
+        .collect::<Vec<_>>();
+    let available = local
+        .iter()
+        .find(|(_, status)| *status == SparkStatus::Available);
+    let spark = available
+        .map(|(_, status)| *status)
+        .or_else(|| local.iter().map(|(_, status)| *status).next())
+        .unwrap_or(SparkStatus::None);
     let recommendation = if claude == ProviderStatus::Ok {
         "claude"
     } else if codex == ProviderStatus::Ok {
         "codex"
-    } else if spark == SparkStatus::Available {
-        "spark"
+    } else if let Some((name, _)) = available {
+        return Verdict {
+            claude,
+            codex,
+            spark,
+            recommendation: format!("local:{name}"),
+            reason: [
+                claude_reason,
+                codex_reason,
+                Some(format!("{name} available")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; "),
+        };
     } else {
         "conserve"
     };
+    let local_name = local
+        .first()
+        .map(|(name, _)| name.as_str())
+        .unwrap_or("Local AI");
     let spark_reason = match spark {
-        SparkStatus::Available => Some("Spark available".to_string()),
-        SparkStatus::Busy => Some("Spark busy".to_string()),
-        SparkStatus::Down => Some("Spark down".to_string()),
+        SparkStatus::Available => Some(format!("{local_name} available")),
+        SparkStatus::Busy => Some(format!("{local_name} busy")),
+        SparkStatus::Down => Some(format!("{local_name} down")),
         SparkStatus::None => None,
     };
     let reason = [claude_reason, codex_reason, spark_reason]
@@ -141,6 +186,8 @@ fn provider_status(
     }
     let mut worst = ProviderStatus::Ok;
     let mut worst_rank = 0;
+    // Among windows with the same status, the most-used one explains it best.
+    let mut reason_percent = f64::MIN;
     let mut reason = None;
     for reading in readings {
         let stale = now - reading["as_of"].as_i64().unwrap_or(0) > stale_after;
@@ -187,9 +234,10 @@ fn provider_status(
                 ProviderStatus::Unknown => 1,
                 ProviderStatus::Ok => 0,
             };
-            if rank >= worst_rank {
+            if rank > worst_rank || (rank == worst_rank && percent > reason_percent) {
                 worst = status;
                 worst_rank = rank;
+                reason_percent = percent;
                 reason = Some(window_reason(title, window, percent, pace, now));
             }
         }
@@ -226,12 +274,14 @@ fn spark_status(spark: Option<&Value>, now: i64) -> SparkStatus {
     {
         return SparkStatus::Down;
     }
-    let running = spark["endpoints"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|endpoint| endpoint["running"].as_i64())
-        .sum::<i64>();
+    let running = spark["running"].as_i64().unwrap_or_else(|| {
+        spark["endpoints"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|endpoint| endpoint["running"].as_i64())
+            .sum::<i64>()
+    });
     if running <= 2 {
         SparkStatus::Available
     } else {
