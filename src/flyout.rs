@@ -315,8 +315,18 @@ unsafe fn begin_close() {
     WINDOW.with(|window| {
         let hwnd = window.get();
         if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 {
-            CLOSING_AT.with(|closing| *closing.borrow_mut() = Some(Instant::now()));
-            SetTimer(hwnd, ANIMATION_TIMER, 16, None);
+            // Start the fade only once: the hover timer calls hide() every
+            // 100 ms, and restarting the fade each time made the card flash.
+            let started = CLOSING_AT.with(|closing| {
+                let mut closing = closing.borrow_mut();
+                closing.is_none() && {
+                    *closing = Some(Instant::now());
+                    true
+                }
+            });
+            if started {
+                SetTimer(hwnd, ANIMATION_TIMER, 16, None);
+            }
         }
     });
 }
