@@ -92,6 +92,60 @@ pub struct Snapshot {
     pub updated: String,
 }
 
+#[allow(dead_code)]
+fn worst_limit_index(bars: &[Bar]) -> Option<usize> {
+    bars.iter()
+        .enumerate()
+        .max_by_key(|(_, bar)| {
+            let state = crate::render::strip_item_state(
+                Some(bar.percent),
+                Some((bar.elapsed / 100.0) as f32),
+                Some(bar.projected as f32),
+                bar.full_at.is_some(),
+            );
+            match state {
+                crate::render::ItemState::Ok => 0,
+                crate::render::ItemState::Warn => 1,
+                crate::render::ItemState::Crit => 2,
+            }
+        })
+        .map(|(index, _)| index)
+}
+
+#[allow(dead_code)]
+fn provider_status_text(provider: &str, bars: &[Bar]) -> String {
+    let Some(bar) = worst_limit_index(bars).and_then(|index| bars.get(index)) else {
+        return format!("{provider} · No readings");
+    };
+    if let Some(time) = &bar.full_at {
+        format!("{provider} · Runs out {time}")
+    } else {
+        format!("{provider} · On pace")
+    }
+}
+
+#[allow(dead_code)]
+fn age_copy(seconds: i64, stale: bool) -> String {
+    let seconds = seconds.max(0);
+    let value = if seconds >= 3600 {
+        format!("{} h", seconds / 3600)
+    } else if seconds >= 60 {
+        format!("{} m", seconds / 60)
+    } else {
+        format!("{} s", seconds)
+    };
+    format!("{value} {}", if stale { "old" } else { "ago" })
+}
+
+#[allow(dead_code)]
+fn reset_time_copy(today: bool, weekday: &str, time: &str) -> String {
+    if today {
+        time.to_owned()
+    } else {
+        format!("{weekday} {time}")
+    }
+}
+
 #[derive(Clone)]
 struct View {
     snapshot: Snapshot,
@@ -547,25 +601,39 @@ unsafe fn draw_content(
     SelectObject(dc, small);
     let controls_left = controls[2].1.left;
     draw_text_right(dc, controls_left - 6, y + 2, &snapshot.updated, muted);
-    SelectObject(dc, normal);
     let refresh = controls[2].1;
-    draw_text(dc, refresh.left + (4.0 * scale) as i32, y, "↻", muted);
-    let pin = controls[1].1;
-    draw_pin(
+    draw_shared_glyph(
         dc,
-        pin.left + (5.0 * scale) as i32,
-        y + 1,
-        scale,
-        pinned,
+        refresh.left + (4.0 * scale) as i32,
+        refresh.top + (4.0 * scale) as i32,
+        (14.0 * scale).round() as i32,
+        crate::render::CardGlyph::Refresh,
         muted,
+        card_bg,
+    );
+    let pin = controls[1].1;
+    draw_shared_glyph(
+        dc,
+        pin.left + (4.0 * scale) as i32,
+        pin.top + (4.0 * scale) as i32,
+        (14.0 * scale).round() as i32,
+        if pinned {
+            crate::render::CardGlyph::PinFilled
+        } else {
+            crate::render::CardGlyph::Pin
+        },
+        muted,
+        card_bg,
     );
     let close = controls[0].1;
-    draw_close(
+    draw_shared_glyph(
         dc,
         close.left + (4.0 * scale) as i32,
         close.top + (4.0 * scale) as i32,
-        scale,
+        (14.0 * scale).round() as i32,
+        crate::render::CardGlyph::Close,
         muted,
+        card_bg,
     );
     y += (30.0 * scale) as i32;
 
@@ -913,81 +981,44 @@ unsafe fn draw_provider_mark(
     color: COLORREF,
     background: COLORREF,
 ) {
-    if provider == ProviderKind::Codex {
-        let mask = crate::render::draw_codex_mark(size);
-        for py in 0..size {
-            for px in 0..size {
-                let coverage = mask[(py * size + px) as usize];
-                if coverage > 0.0 {
-                    SetPixelV(dc, x + px, y + py, blend_color(background, color, coverage));
-                }
-            }
-        }
-        return;
-    }
-    let pen = CreatePen(PS_SOLID, (size as f32 / 8.0).round().max(1.0) as i32, color);
-    let old = SelectObject(dc, pen);
-    let c = POINT {
-        x: x + size / 2,
-        y: y + size / 2,
+    let mask = match provider {
+        ProviderKind::Claude => crate::render::draw_mark(size),
+        ProviderKind::Codex => crate::render::draw_codex_mark(size),
+        ProviderKind::Spark => crate::render::draw_spark_mark(size),
     };
-    match provider {
-        ProviderKind::Claude => {
-            for (dx, dy) in [(0, 6), (6, 0), (4, 4), (4, -4)] {
-                MoveToEx(dc, c.x - dx, c.y - dy, null_mut());
-                LineTo(dc, c.x + dx, c.y + dy);
-            }
-        }
-        ProviderKind::Codex => unreachable!(),
-        ProviderKind::Spark => {
-            RoundRect(dc, x + 3, y + 3, x + size - 3, y + size - 3, 3, 3);
-            for o in [5, size - 5] {
-                MoveToEx(dc, x, y + o, null_mut());
-                LineTo(dc, x + 3, y + o);
-                MoveToEx(dc, x + size - 3, y + o, null_mut());
-                LineTo(dc, x + size, y + o);
-                MoveToEx(dc, x + o, y, null_mut());
-                LineTo(dc, x + o, y + 3);
-                MoveToEx(dc, x + o, y + size - 3, null_mut());
-                LineTo(dc, x + o, y + size);
-            }
-        }
-    }
-    SelectObject(dc, old);
-    DeleteObject(pen);
-}
-unsafe fn draw_pin(dc: HDC, x: i32, y: i32, scale: f32, pinned: bool, color: COLORREF) {
-    let pen = CreatePen(PS_SOLID, (1.3 * scale).round().max(1.0) as i32, color);
-    let brush = if pinned {
-        CreateSolidBrush(color)
-    } else {
-        GetStockObject(HOLLOW_BRUSH)
-    };
-    let op = SelectObject(dc, pen);
-    let ob = SelectObject(dc, brush);
-    let w = (10.0 * scale) as i32;
-    let h = (7.0 * scale) as i32;
-    Ellipse(dc, x, y, x + w, y + h);
-    MoveToEx(dc, x + w / 2, y + h, null_mut());
-    LineTo(dc, x + w / 2, y + (13.0 * scale) as i32);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    if pinned {
-        DeleteObject(brush);
-    }
-    DeleteObject(pen);
+    draw_mask(dc, x, y, size, &mask, color, background);
 }
 
-unsafe fn draw_close(dc: HDC, x: i32, y: i32, scale: f32, color: COLORREF) {
-    let size = (10.0 * scale).round() as i32;
-    let pen = CreatePen(PS_SOLID, (1.3 * scale).round().max(1.0) as i32, color);
-    let old = SelectObject(dc, pen);
-    MoveToEx(dc, x, y, null_mut());
-    LineTo(dc, x + size, y + size);
-    MoveToEx(dc, x + size, y, null_mut());
-    LineTo(dc, x, y + size);
-    SelectObject(dc, old);
-    DeleteObject(pen);
+unsafe fn draw_mask(
+    dc: HDC,
+    x: i32,
+    y: i32,
+    size: i32,
+    mask: &[f32],
+    color: COLORREF,
+    background: COLORREF,
+) {
+    for py in 0..size {
+        for px in 0..size {
+            let coverage = mask[(py * size + px) as usize];
+            if coverage > 0.0 {
+                SetPixelV(dc, x + px, y + py, blend_color(background, color, coverage));
+            }
+        }
+    }
+}
+
+unsafe fn draw_shared_glyph(
+    dc: HDC,
+    x: i32,
+    y: i32,
+    size: i32,
+    glyph: crate::render::CardGlyph,
+    color: COLORREF,
+    background: COLORREF,
+) {
+    let mask = crate::render::draw_card_glyph(size, glyph);
+    draw_mask(dc, x, y, size, &mask, color, background);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1380,5 +1411,38 @@ mod tests {
             header_hit_test(180, 50, width, 1.0, &sections),
             HeaderHit::None
         );
+    }
+
+    #[test]
+    fn worst_limit_and_status_copy_use_the_most_severe_limit() {
+        let bars = vec![
+            Bar {
+                percent: 20.0,
+                elapsed: 40.0,
+                projected: 50.0,
+                ..Default::default()
+            },
+            Bar {
+                percent: 70.0,
+                elapsed: 40.0,
+                projected: 100.0,
+                full_at: Some("8:52 PM".into()),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(worst_limit_index(&bars), Some(1));
+        assert_eq!(
+            provider_status_text("Claude", &bars),
+            "Claude · Runs out 8:52 PM"
+        );
+    }
+
+    #[test]
+    fn age_and_reset_copy_follow_compact_rules() {
+        assert_eq!(age_copy(24, false), "24 s ago");
+        assert_eq!(age_copy(300, false), "5 m ago");
+        assert_eq!(age_copy(21600, true), "6 h old");
+        assert_eq!(reset_time_copy(true, "Thu", "10:19 PM"), "10:19 PM");
+        assert_eq!(reset_time_copy(false, "Thu", "8:59 AM"), "Thu 8:59 AM");
     }
 }

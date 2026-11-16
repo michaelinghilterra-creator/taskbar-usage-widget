@@ -43,7 +43,7 @@ const WM_APP_PROVIDER: u32 = WM_APP + 3;
 const T_LAYOUT: usize = 1; // keeps the widget attached and positioned
 const T_ROLL: usize = 5; // animation frames while numbers roll
 /// How long a changed number rolls.
-const ROLL_SECS: f32 = 0.45;
+const ROLL_SECS: f32 = 0.30;
 const T_TICK: usize = 3; // refreshes tooltip countdowns
 const T_PROVIDER: usize = 4;
 const T_SPARK_PULSE: usize = 6;
@@ -137,7 +137,7 @@ struct RenderKey {
     dark: bool,
     hover: bool,
     /// Per account: rounded 5-hour %, weekly %, Fable %, stale.
-    rows: Vec<(Option<i64>, Option<i64>, Option<i64>, bool, Option<u32>)>,
+    rows: Vec<(Option<i64>, Option<i64>, Option<i64>, bool, Option<u32>, u8)>,
     show_left: bool,
     font_size: u32,
     icon_size: u32,
@@ -154,7 +154,7 @@ struct RenderKey {
     hide_week: bool,
     hide_fable: bool,
     rows_per_col: u32,
-    providers: (bool, bool, bool, Option<i64>, Option<i64>, u8),
+    providers: (bool, bool, bool, Option<i64>, Option<i64>, u8, u8, u8),
 }
 
 /// One Claude Code login, found in its config folder.
@@ -172,6 +172,8 @@ struct Account {
     fetching: bool,
     /// Rate-limit errors in a row; each one doubles the wait.
     rate_limited: u32,
+    critical_active: [bool; 3],
+    critical_since: [Option<Instant>; 3],
 }
 
 impl Account {
@@ -187,6 +189,8 @@ impl Account {
             error: None,
             fetching: false,
             rate_limited: 0,
+            critical_active: [false; 3],
+            critical_since: [None; 3],
         }
     }
 
@@ -246,6 +250,8 @@ struct State {
     show_spark: bool,
     spark_host: String,
     codex: Option<providers::Reading>,
+    codex_critical_active: [bool; 2],
+    codex_critical_since: [Option<Instant>; 2],
     codex_sig: Vec<(PathBuf, u64, i64)>,
     codex_checked_at: i64,
     spark: Option<providers::SparkSnapshot>,
@@ -277,7 +283,9 @@ thread_local! {
         dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
         font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, ring_margin: DEFAULT_RING_MARGIN, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
-        show_claude: true, show_codex: true, show_spark: true, spark_host: String::new(), codex: None, codex_sig: Vec::new(), codex_checked_at: 0, spark: None, spark_history: Vec::new(), history: None,
+        show_claude: true, show_codex: true, show_spark: true, spark_host: String::new(), codex: None,
+        codex_critical_active: [false; 2], codex_critical_since: [None; 2],
+        codex_sig: Vec::new(), codex_checked_at: 0, spark: None, spark_history: Vec::new(), history: None,
         token_tracker: std::sync::Arc::new(std::sync::Mutex::new(tokens::Tracker::default())),
         token_totals: tokens::Totals { claude: 0, claude_output: 0, codex: 0 }, tokens_checked_at: 0,
         alerts: true, alerted_periods: HashMap::new(), high_windows: HashMap::new(), spark_was_up: None,
@@ -426,6 +434,7 @@ fn main() {
         ensure_widget();
         SetTimer(ctl, T_LAYOUT, 1000, None);
         SetTimer(ctl, T_TICK, 30_000, None);
+        SetTimer(ctl, T_ROLL, 15, None);
         with(|s| s.history = storage::History::load(now()).ok());
         SetTimer(ctl, T_PROVIDER, provider_poll_ms(), None);
         start_fetch_all();
@@ -487,6 +496,28 @@ fn on_result(res: FetchResult) {
         let limited = matches!(res.r, Err(api::FetchError::RateLimited));
         match res.r {
             Ok(u) => {
+                let limits = [&u.five_hour, &u.weekly, &u.fable];
+                let durations = [18000, 604800, 604800];
+                for index in 0..3 {
+                    let critical = limits[index].as_ref().is_some_and(|limit| {
+                        limit.percent > 95.0
+                            || providers::pace(
+                                limit.percent,
+                                limit.resets_at,
+                                Some(durations[index]),
+                                now(),
+                                None,
+                            )
+                            .projected
+                                >= 100.0
+                    });
+                    if critical && !a.critical_active[index] {
+                        a.critical_since[index] = Some(Instant::now());
+                    } else if !critical {
+                        a.critical_since[index] = None;
+                    }
+                    a.critical_active[index] = critical;
+                }
                 a.prev = a
                     .usage
                     .clone()
@@ -665,6 +696,16 @@ fn ensure_widget() {
                         ],
                         text: [None, None, None],
                         critical: [false; 3],
+                        loading: a.usage.is_none() && a.fetching,
+                        pulse_alpha: if a.usage.is_none() && a.fetching {
+                            loading_pulse_alpha()
+                        } else {
+                            a.critical_since
+                                .iter()
+                                .flatten()
+                                .map(critical_pulse_alpha)
+                                .fold(1.0, f32::min)
+                        },
                     }
                 })
                 .collect();
@@ -693,6 +734,7 @@ fn ensure_widget() {
                             pct(r.fable),
                             r.stale,
                             r.roll.map(|(_, t)| (t * 1000.0) as u32),
+                            (r.pulse_alpha * 100.0) as u8,
                         )
                     })
                     .collect(),
@@ -726,6 +768,20 @@ fn ensure_widget() {
                     } else {
                         0
                     },
+                    (if s.codex_checked_at == 0 {
+                        loading_pulse_alpha()
+                    } else {
+                        s.codex_critical_since
+                            .iter()
+                            .flatten()
+                            .map(critical_pulse_alpha)
+                            .fold(1.0, f32::min)
+                    } * 100.0) as u8,
+                    (if !s.spark_host.is_empty() && s.spark.is_none() {
+                        loading_pulse_alpha()
+                    } else {
+                        1.0
+                    } * 100.0) as u8,
                 ),
             };
             let codex_rows = s
@@ -761,30 +817,74 @@ fn ensure_widget() {
                         ],
                         text: [None, None, None],
                         critical: [false; 3],
+                        loading: false,
+                        pulse_alpha: s
+                            .codex_critical_since
+                            .iter()
+                            .flatten()
+                            .map(critical_pulse_alpha)
+                            .fold(1.0, f32::min),
                     }]
                 })
-                .unwrap_or_default();
-            let spark_row = s.spark.as_ref().map(|spark| {
-                let down = spark.error.is_some() || !spark.up;
-                let text = if down {
-                    "down".to_string()
-                } else if spark.tok_s <= 0.0 {
-                    "idle".to_string()
-                } else {
-                    format!("{:.0} t/s", spark.tok_s)
-                };
-                render::Row {
-                    five: Some(spark.tok_s),
-                    week: None,
-                    fable: None,
-                    roll: None,
-                    stale: false,
-                    pace: [None; 3],
-                    projected: [None; 3],
-                    text: [Some(text), None, None],
-                    critical: [down, false, false],
-                }
-            });
+                .unwrap_or_else(|| {
+                    (s.codex_checked_at == 0)
+                        .then(|| render::Row {
+                            five: None,
+                            week: None,
+                            fable: None,
+                            roll: None,
+                            stale: false,
+                            pace: [None; 3],
+                            projected: [None; 3],
+                            text: [None, None, None],
+                            critical: [false; 3],
+                            loading: true,
+                            pulse_alpha: loading_pulse_alpha(),
+                        })
+                        .into_iter()
+                        .collect()
+                });
+            let spark_row = s
+                .spark
+                .as_ref()
+                .map(|spark| {
+                    let down = spark.error.is_some() || !spark.up;
+                    let text = if down {
+                        "down".to_string()
+                    } else if spark.tok_s <= 0.0 {
+                        "idle".to_string()
+                    } else {
+                        format!("{:.0} t/s", spark.tok_s)
+                    };
+                    render::Row {
+                        five: Some(spark.tok_s),
+                        week: None,
+                        fable: None,
+                        roll: None,
+                        stale: false,
+                        pace: [None; 3],
+                        projected: [None; 3],
+                        text: [Some(text), None, None],
+                        critical: [down, false, false],
+                        loading: false,
+                        pulse_alpha: 1.0,
+                    }
+                })
+                .or_else(|| {
+                    (!s.spark_host.is_empty()).then(|| render::Row {
+                        five: None,
+                        week: None,
+                        fable: None,
+                        roll: None,
+                        stale: false,
+                        pace: [None; 3],
+                        projected: [None; 3],
+                        text: [None, None, None],
+                        critical: [false; 3],
+                        loading: true,
+                        pulse_alpha: loading_pulse_alpha(),
+                    })
+                });
             let model = render::Model {
                 rows,
                 hover: s.hover,
@@ -1873,6 +1973,31 @@ fn persist_state(s: &mut State, t: i64) {
 
 fn on_provider_result(r: ProviderResult) {
     let spark_notice = with(|s| {
+        for (index, key) in ["5h", "week"].iter().enumerate() {
+            let critical = r
+                .codex
+                .windows
+                .iter()
+                .find(|window| window.key == *key)
+                .is_some_and(|window| {
+                    window.percent > 95.0
+                        || providers::pace(
+                            window.percent,
+                            window.resets_at,
+                            window.window_secs,
+                            now(),
+                            None,
+                        )
+                        .projected
+                            >= 100.0
+                });
+            if critical && !s.codex_critical_active[index] {
+                s.codex_critical_since[index] = Some(Instant::now());
+            } else if !critical {
+                s.codex_critical_since[index] = None;
+            }
+            s.codex_critical_active[index] = critical;
+        }
         s.codex = Some(r.codex);
         s.codex_sig = r.codex_sig;
         if r.codex_checked {
@@ -1902,6 +2027,9 @@ fn on_provider_result(r: ProviderResult) {
         } else {
             KillTimer(ctl, T_SPARK_PULSE);
         }
+        if with(|s| s.codex_critical_since.iter().any(Option::is_some)) {
+            SetTimer(ctl, T_ROLL, 15, None);
+        }
     }
     ensure_widget();
     update_tooltip();
@@ -1912,7 +2040,24 @@ fn spark_pulse_alpha() -> f32 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f32();
-    0.72 + 0.28 * (seconds * std::f32::consts::TAU).sin()
+    0.65 + 0.35 * (seconds * std::f32::consts::TAU).cos()
+}
+
+fn loading_pulse_alpha() -> f32 {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f32();
+    0.7 + 0.3 * (seconds / 1.2 * std::f32::consts::TAU).cos()
+}
+
+fn critical_pulse_alpha(started: &Instant) -> f32 {
+    let elapsed = started.elapsed().as_secs_f32();
+    if elapsed >= 1.8 {
+        1.0
+    } else {
+        0.675 + 0.325 * (elapsed / 0.6 * std::f32::consts::TAU).cos()
+    }
 }
 
 fn provider_poll_ms() -> u32 {
@@ -2946,16 +3091,33 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             match wp {
                 T_LAYOUT => ensure_widget(),
                 T_ROLL => {
-                    let rolling = with(|s| {
+                    let animating = with(|s| {
                         for a in &mut s.accounts {
                             a.prev = a
                                 .prev
                                 .take()
                                 .filter(|(_, at)| at.elapsed().as_secs_f32() < ROLL_SECS);
+                            for started in &mut a.critical_since {
+                                if started.is_some_and(|at| at.elapsed().as_secs_f32() >= 1.8) {
+                                    *started = None;
+                                }
+                            }
+                        }
+                        for started in &mut s.codex_critical_since {
+                            if started.is_some_and(|at| at.elapsed().as_secs_f32() >= 1.8) {
+                                *started = None;
+                            }
                         }
                         s.accounts.iter().any(|a| a.prev.is_some())
+                            || s.accounts
+                                .iter()
+                                .any(|a| a.critical_since.iter().any(Option::is_some))
+                            || s.codex_critical_since.iter().any(Option::is_some)
+                            || s.accounts.iter().any(|a| a.usage.is_none() && a.fetching)
+                            || s.codex_checked_at == 0
+                            || (!s.spark_host.is_empty() && s.spark.is_none())
                     });
-                    if !rolling {
+                    if !animating {
                         KillTimer(hwnd, T_ROLL);
                     }
                     ensure_widget(); // the next frame, or the settled numbers

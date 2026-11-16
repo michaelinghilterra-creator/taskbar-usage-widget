@@ -11,6 +11,8 @@ use windows_sys::Win32::Graphics::Gdi::*;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgba(pub f32, pub f32, pub f32, pub f32);
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub label: Rgba,
     pub value: Rgba,
@@ -18,6 +20,21 @@ pub struct Palette {
     pub crit: Rgba,
     pub divider: Rgba,
     pub hover: Rgba,
+    pub track: Rgba,
+    pub elapsed: Rgba,
+    pub claude: Rgba,
+    pub codex: Rgba,
+    pub spark: Rgba,
+    pub card_background: Rgba,
+    pub card_border: Rgba,
+    pub panel: Rgba,
+    pub panel_border: Rgba,
+    pub faint: Rgba,
+    pub meter_track: Rgba,
+    pub meter_elapsed: Rgba,
+    pub separator: Rgba,
+    pub good: Rgba,
+    pub idle: Rgba,
 }
 
 pub fn palette(dark: bool) -> Palette {
@@ -31,28 +48,113 @@ pub fn palette(dark: bool) -> Palette {
     };
     if dark {
         Palette {
-            label: c(0xFFFFFF, 0.62),
-            value: c(0xFFFFFF, 1.0),
-            warn: c(0xF5A35C, 1.0),
-            crit: c(0xFF7B72, 1.0),
-            divider: c(0xFFFFFF, 0.22),
+            label: c(0x9A9AA3, 1.0),
+            value: c(0xF2F2F4, 1.0),
+            warn: c(0xE8A33D, 1.0),
+            crit: c(0xFF6B61, 1.0),
+            divider: c(0x3A3A40, 1.0),
             hover: c(0xFFFFFF, 0.07),
+            track: c(0x3A3A40, 1.0),
+            elapsed: c(0x5A5A62, 1.0),
+            claude: c(0xD97757, 1.0),
+            codex: c(0x4C9AFF, 1.0),
+            spark: c(0x76B900, 1.0),
+            card_background: c(0x1E1E21, 1.0),
+            card_border: c(0x323238, 1.0),
+            panel: c(0x26262B, 1.0),
+            panel_border: c(0x2E2E33, 1.0),
+            faint: c(0x6E6E77, 1.0),
+            meter_track: c(0x36363C, 1.0),
+            meter_elapsed: c(0x4C4C54, 1.0),
+            separator: c(0x34343A, 1.0),
+            good: c(0x7EAE5B, 1.0),
+            idle: c(0x8A8A93, 1.0),
         }
     } else {
         Palette {
-            label: c(0x000000, 0.52),
-            value: c(0x1B1B1B, 1.0),
-            warn: c(0xB4500F, 1.0),
+            label: c(0x5F5F68, 1.0),
+            value: c(0x1B1B1F, 1.0),
+            warn: c(0xA86200, 1.0),
             crit: c(0xC42B1C, 1.0),
-            divider: c(0x000000, 0.18),
+            divider: c(0xD0D0D6, 1.0),
             hover: c(0xFFFFFF, 0.55),
+            track: c(0xD4D4DA, 1.0),
+            elapsed: c(0xB0B0B8, 1.0),
+            claude: c(0xD97757, 1.0),
+            codex: c(0x4C9AFF, 1.0),
+            spark: c(0x76B900, 1.0),
+            card_background: c(0xF3F3F6, 1.0),
+            card_border: c(0xDCDCE1, 1.0),
+            panel: c(0xFFFFFF, 1.0),
+            panel_border: c(0xE4E4E9, 1.0),
+            faint: c(0x85858E, 1.0),
+            meter_track: c(0xE4E4E9, 1.0),
+            meter_elapsed: c(0xC8C8CF, 1.0),
+            separator: c(0xE8E8EC, 1.0),
+            good: c(0x41781C, 1.0),
+            idle: c(0x8A8A93, 1.0),
         }
     }
 }
 
-const RING_BLUE: Rgba = Rgba(0.298, 0.608, 0.961, 1.0); // #4C9BF5
+const RING_BLUE: Rgba = Rgba(0.298, 0.604, 1.0, 1.0); // #4C9AFF
 pub const CLAUDE_ORANGE: Rgba = Rgba(0.851, 0.467, 0.341, 1.0); // #D97757
 const SPARK_GREEN: Rgba = Rgba(0.463, 0.725, 0.0, 1.0); // #76B900
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemState {
+    Ok,
+    Warn,
+    Crit,
+}
+
+pub fn strip_item_state(
+    used: Option<f64>,
+    elapsed_fraction: Option<f32>,
+    projected: Option<f32>,
+    critical: bool,
+) -> ItemState {
+    if critical
+        || used.is_some_and(|value| value > 95.0)
+        || projected.is_some_and(|value| value >= 100.0)
+    {
+        ItemState::Crit
+    } else if used.is_some_and(|value| {
+        value > 50.0
+            && elapsed_fraction.is_some_and(|elapsed| value > elapsed as f64 * 100.0 + 10.0)
+    }) {
+        ItemState::Warn
+    } else {
+        ItemState::Ok
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentBand {
+    Used,
+    Projected,
+    Elapsed,
+    Track,
+}
+
+#[allow(dead_code)]
+pub fn segment_band(index: usize, used: f32, projected: f32, elapsed: f32) -> SegmentBand {
+    let midpoint = (index as f32 + 0.5) * 5.0;
+    if midpoint < used {
+        SegmentBand::Used
+    } else if midpoint < projected {
+        SegmentBand::Projected
+    } else if midpoint < elapsed {
+        SegmentBand::Elapsed
+    } else {
+        SegmentBand::Track
+    }
+}
+
+pub fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
 
 /// One account's numbers.
 #[derive(Clone)]
@@ -69,6 +171,10 @@ pub struct Row {
     pub projected: [Option<f32>; 3],
     pub text: [Option<String>; 3],
     pub critical: [bool; 3],
+    /// No reading has arrived yet and a request is in flight.
+    pub loading: bool,
+    /// Opacity for loading tracks and critical-entry number pulses.
+    pub pulse_alpha: f32,
 }
 
 /// Most accounts that fit in one column.
@@ -275,6 +381,9 @@ struct Divider {
 /// `vert = Some(width)` for a vertical taskbar: one line per limit, stacked under
 /// the icon, shrunk until it fits that width.
 pub fn render(m: &Model, h: i32, scale: f32, vert: Option<i32>) -> Frame {
+    if !m.rings {
+        return render_forecast_strip(m, h, scale, vert.is_some());
+    }
     let mut frames = Vec::new();
     if m.show_claude {
         let mut model = m.clone();
@@ -330,6 +439,659 @@ pub fn render(m: &Model, h: i32, scale: f32, vert: Option<i32>) -> Frame {
         };
     }
     combine(frames, vert.is_some(), m.dark, scale)
+}
+
+fn color_for_state(state: ItemState, accent: Rgba, pal: &Palette) -> Rgba {
+    match state {
+        ItemState::Ok => accent,
+        ItemState::Warn => pal.warn,
+        ItemState::Crit => pal.crit,
+    }
+}
+
+fn number_color_for_state(state: ItemState, pal: &Palette) -> Rgba {
+    match state {
+        ItemState::Ok => pal.value,
+        ItemState::Warn => pal.warn,
+        ItemState::Crit => pal.crit,
+    }
+}
+
+fn over_pixel(pixel: &mut [u8; 4], color: Rgba, coverage: f32) {
+    let alpha = (color.3 * coverage).clamp(0.0, 1.0);
+    let source = [color.2, color.1, color.0];
+    let old_alpha = pixel[3] as f32 / 255.0;
+    for channel in 0..3 {
+        let old = pixel[channel] as f32 / 255.0;
+        pixel[channel] = ((source[channel] * alpha + old * (1.0 - alpha)) * 255.0 + 0.5) as u8;
+    }
+    pixel[3] = ((alpha + old_alpha * (1.0 - alpha)) * 255.0 + 0.5) as u8;
+}
+
+fn paint_rect(frame: &mut Frame, rect: (i32, i32, i32, i32), radius: f32, color: Rgba) {
+    let (left, top, right, bottom) = rect;
+    for y in top.max(0)..bottom.min(frame.h) {
+        for x in left.max(0)..right.min(frame.w) {
+            let coverage = rounded_rect_cov(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                left as f32,
+                top as f32,
+                right as f32,
+                bottom as f32,
+                radius,
+            );
+            over_pixel(&mut frame.px[(y * frame.w + x) as usize], color, coverage);
+        }
+    }
+}
+
+fn paint_mask(frame: &mut Frame, x: i32, y: i32, size: i32, mask: &[f32], color: Rgba) {
+    for my in 0..size {
+        for mx in 0..size {
+            let (px, py) = (x + mx, y + my);
+            if px >= 0 && px < frame.w && py >= 0 && py < frame.h {
+                over_pixel(
+                    &mut frame.px[(py * frame.w + px) as usize],
+                    color,
+                    mask[(my * size + mx) as usize],
+                );
+            }
+        }
+    }
+}
+
+unsafe fn paint_text(
+    frame: &mut Frame,
+    text: &str,
+    rect: RECT,
+    px: i32,
+    semibold: bool,
+    color: Rgba,
+    flags: u32,
+) {
+    if text.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..std::mem::zeroed()
+        },
+        ..std::mem::zeroed()
+    };
+    let dc = CreateCompatibleDC(std::ptr::null_mut());
+    let mut bits = std::ptr::null_mut();
+    let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+    let old_bmp = SelectObject(dc, bmp);
+    let font = make_font(
+        px.max(1),
+        if semibold {
+            &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"]
+        } else {
+            &["Segoe UI Variable Text", "Segoe UI"]
+        },
+    );
+    let old_font = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT as i32);
+    SetTextColor(dc, 0x00FFFFFF);
+    let wide = text.encode_utf16().collect::<Vec<_>>();
+    let mut local = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    DrawTextW(
+        dc,
+        wide.as_ptr(),
+        wide.len() as i32,
+        &mut local,
+        DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | flags,
+    );
+    GdiFlush();
+    let mask = std::slice::from_raw_parts(bits.cast::<[u8; 4]>(), (width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let sample = mask[(y * width + x) as usize];
+            let coverage = (sample[0] as f32 + sample[1] as f32 + sample[2] as f32) / (3.0 * 255.0);
+            if coverage > 0.0 {
+                over_pixel(
+                    &mut frame.px[((rect.top + y) * frame.w + rect.left + x) as usize],
+                    color,
+                    coverage,
+                );
+            }
+        }
+    }
+    SelectObject(dc, old_font);
+    SelectObject(dc, old_bmp);
+    DeleteObject(font);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+}
+
+unsafe fn measure_text_width(text: &str, px: i32, semibold: bool) -> i32 {
+    let dc = CreateCompatibleDC(std::ptr::null_mut());
+    let font = make_font(
+        px.max(1),
+        if semibold {
+            &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"]
+        } else {
+            &["Segoe UI Variable Text", "Segoe UI"]
+        },
+    );
+    let old_font = SelectObject(dc, font);
+    let wide = text.encode_utf16().collect::<Vec<_>>();
+    let mut size = SIZE { cx: 0, cy: 0 };
+    GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut size);
+    SelectObject(dc, old_font);
+    DeleteObject(font);
+    DeleteDC(dc);
+    size.cx.max(1)
+}
+
+fn new_frame(width: i32, height: i32) -> Frame {
+    Frame {
+        w: width.max(1),
+        h: height.max(1),
+        px: vec![[0, 0, 0, 1]; (width.max(1) * height.max(1)) as usize],
+        groups: Vec::new(),
+    }
+}
+
+fn limit_ids(m: &Model, rows: &[Row], claude: bool) -> Vec<usize> {
+    [
+        !m.hide_five && (claude || rows.iter().any(|row| row.five.is_some() || row.loading)),
+        !m.hide_week,
+        !m.hide_fable && rows.iter().any(|row| row.fable.is_some()),
+    ]
+    .iter()
+    .enumerate()
+    .filter_map(|(index, shown)| shown.then_some(index))
+    .collect()
+}
+
+fn limit_group_width(item_count: usize, scale: f32) -> i32 {
+    let s = |value: f32| (value * scale).round() as i32;
+    s(16.0)
+        + if item_count == 0 {
+            0
+        } else {
+            s(8.0) + item_count as i32 * s(30.0) + item_count.saturating_sub(1) as i32 * s(8.0)
+        }
+}
+
+fn limit_group_height(item_count: usize, scale: f32) -> i32 {
+    let s = |value: f32| (value * scale).round() as i32;
+    s(16.0)
+        + if item_count == 0 {
+            0
+        } else {
+            s(8.0) + item_count as i32 * s(22.0) + item_count.saturating_sub(1) as i32 * s(6.0)
+        }
+}
+
+fn render_forecast_strip(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
+    let pal = palette(m.dark);
+    let claude_ids = limit_ids(m, &m.rows, true);
+    let codex_ids = limit_ids(m, &m.codex_rows, false);
+    let spark_shown = m.show_spark && m.spark_row.is_some();
+    let s = |value: f32| (value * scale).round() as i32;
+    let mut shown = Vec::new();
+    if m.show_claude {
+        shown.push((Group::Claude, limit_group_width(claude_ids.len(), scale)));
+    }
+    if m.show_codex {
+        shown.push((Group::Codex, limit_group_width(codex_ids.len(), scale)));
+    }
+    if spark_shown {
+        shown.push((Group::Spark, s(104.0)));
+    }
+    if shown.is_empty() {
+        return new_frame(1, h);
+    }
+    if vertical {
+        let heights = shown
+            .iter()
+            .map(|(group, _)| match group {
+                Group::Claude => limit_group_height(claude_ids.len(), scale),
+                Group::Codex => limit_group_height(codex_ids.len(), scale),
+                Group::Spark => s(68.0),
+            })
+            .collect::<Vec<_>>();
+        let width = shown.iter().map(|(_, width)| *width).max().unwrap_or(1) + s(8.0);
+        let height = s(8.0)
+            + heights.iter().sum::<i32>()
+            + s(9.0) * heights.len().saturating_sub(1) as i32
+            + s(8.0);
+        let mut frame = new_frame(width, height);
+        let mut y = s(8.0);
+        for (index, ((group, group_width), group_height)) in
+            shown.iter().zip(heights.iter()).enumerate()
+        {
+            let x = (width - group_width) / 2;
+            draw_forecast_group(&mut frame, m, *group, x, y, scale, true, &pal);
+            frame.groups.push(GroupRange {
+                group: *group,
+                x0: 0,
+                x1: width,
+            });
+            y += group_height;
+            if index + 1 < shown.len() {
+                let left = (width - s(20.0)) / 2;
+                paint_rect(
+                    &mut frame,
+                    (left, y + s(4.0), left + s(20.0), y + s(5.0)),
+                    0.0,
+                    pal.divider,
+                );
+                y += s(9.0);
+            }
+        }
+        return frame;
+    }
+    let separator_space = s(17.0);
+    let width = s(8.0)
+        + shown.iter().map(|(_, width)| *width).sum::<i32>()
+        + separator_space * shown.len().saturating_sub(1) as i32;
+    let mut frame = new_frame(width, h.max(s(48.0)));
+    let mut x = s(4.0);
+    for (index, (group, group_width)) in shown.iter().enumerate() {
+        draw_forecast_group(&mut frame, m, *group, x, 0, scale, false, &pal);
+        frame.groups.push(GroupRange {
+            group: *group,
+            x0: x,
+            x1: x + group_width,
+        });
+        x += group_width;
+        if index + 1 < shown.len() {
+            let top = (frame.h - s(20.0)) / 2;
+            paint_rect(
+                &mut frame,
+                (x + s(8.0), top, x + s(9.0), top + s(20.0)),
+                0.0,
+                pal.divider,
+            );
+            x += separator_space;
+        }
+    }
+    frame
+}
+
+fn draw_forecast_group(
+    frame: &mut Frame,
+    m: &Model,
+    group: Group,
+    x: i32,
+    y: i32,
+    scale: f32,
+    vertical: bool,
+    pal: &Palette,
+) {
+    let s = |value: f32| (value * scale).round() as i32;
+    let (rows, accent, icon) = match group {
+        Group::Claude => (&m.rows, pal.claude, draw_mark(s(16.0))),
+        Group::Codex => (&m.codex_rows, pal.codex, draw_codex_mark(s(16.0))),
+        Group::Spark => (&m.rows, pal.spark, draw_spark_mark(s(16.0))),
+    };
+    if group == Group::Spark {
+        draw_forecast_spark(frame, m, x, y, scale, vertical, pal);
+        return;
+    }
+    let ids = limit_ids(m, rows, group == Group::Claude);
+    let row = rows.first();
+    let stale = row.is_some_and(|row| row.stale);
+    let opacity = if stale { 0.45 } else { 1.0 };
+    let icon_color = Rgba(accent.0, accent.1, accent.2, opacity);
+    let icon_x = if vertical {
+        x + (limit_group_width(ids.len(), scale) - s(16.0)) / 2
+    } else {
+        x
+    };
+    let icon_y = if vertical { y } else { (frame.h - s(16.0)) / 2 };
+    paint_mask(frame, icon_x, icon_y, s(16.0), &icon, icon_color);
+    let mut item_x = if vertical { x } else { x + s(24.0) };
+    let mut item_y = if vertical {
+        y + s(24.0)
+    } else {
+        (frame.h - s(22.0)) / 2
+    };
+    for id in ids {
+        let (value, elapsed, projected, critical, loading, pulse) =
+            row.map_or((None, None, None, false, false, 1.0), |row| {
+                (
+                    [row.five, row.week, row.fable][id],
+                    row.pace[id],
+                    row.projected[id],
+                    row.critical[id],
+                    row.loading,
+                    row.pulse_alpha,
+                )
+            });
+        let state = strip_item_state(value, elapsed, projected, critical);
+        let fill_color = color_for_state(state, accent, pal);
+        let mut number_state_color = number_color_for_state(state, pal);
+        number_state_color.3 *= opacity * if state == ItemState::Crit { pulse } else { 1.0 };
+        let muted = Rgba(pal.label.0, pal.label.1, pal.label.2, opacity);
+        let item_width = s(30.0);
+        let label = ["5h", "W", "F"][id];
+        let number = if loading {
+            "··".to_owned()
+        } else {
+            value
+                .map(|value| {
+                    let used = value.round().clamp(0.0, 100.0) as i32;
+                    if m.show_left { 100 - used } else { used }.to_string()
+                })
+                .unwrap_or_else(|| "—".to_owned())
+        };
+        unsafe {
+            paint_text(
+                frame,
+                if m.hide_labels { "" } else { label },
+                RECT {
+                    left: item_x,
+                    top: item_y,
+                    right: item_x + item_width,
+                    bottom: item_y + s(15.0),
+                },
+                s(10.0),
+                false,
+                muted,
+                DT_LEFT,
+            );
+            let number_rect = RECT {
+                left: item_x,
+                top: item_y,
+                right: item_x + item_width,
+                bottom: item_y + s(15.0),
+            };
+            let number_color = if loading || value.is_none() {
+                muted
+            } else {
+                number_state_color
+            };
+            let old_number = row.and_then(|row| row.roll).and_then(|(from, t)| {
+                from[id].map(|old| {
+                    let used = old.round().clamp(0.0, 100.0) as i32;
+                    let text = (if m.show_left { 100 - used } else { used }).to_string();
+                    (text, ease_out_cubic(t * 1.2))
+                })
+            });
+            if let Some((old, progress)) = old_number.filter(|(old, _)| *old != number) {
+                paint_text(
+                    frame,
+                    &old,
+                    number_rect,
+                    s(13.0),
+                    true,
+                    Rgba(
+                        number_color.0,
+                        number_color.1,
+                        number_color.2,
+                        number_color.3 * (1.0 - progress),
+                    ),
+                    DT_RIGHT,
+                );
+                paint_text(
+                    frame,
+                    &number,
+                    number_rect,
+                    s(13.0),
+                    true,
+                    Rgba(
+                        number_color.0,
+                        number_color.1,
+                        number_color.2,
+                        number_color.3 * progress,
+                    ),
+                    DT_RIGHT,
+                );
+            } else {
+                paint_text(
+                    frame,
+                    &number,
+                    number_rect,
+                    s(13.0),
+                    true,
+                    number_color,
+                    DT_RIGHT,
+                );
+            }
+        }
+        let bar_top = item_y + s(19.0);
+        let bar_bottom = bar_top + s(3.0).max(1);
+        let track_alpha = opacity * if loading { pulse } else { 1.0 };
+        paint_rect(
+            frame,
+            (item_x, bar_top, item_x + item_width, bar_bottom),
+            1.5 * scale,
+            Rgba(pal.track.0, pal.track.1, pal.track.2, track_alpha),
+        );
+        if !loading && value.is_some() {
+            if let Some(elapsed) = elapsed {
+                let right = item_x + (item_width as f32 * elapsed.clamp(0.0, 1.0)).round() as i32;
+                paint_rect(
+                    frame,
+                    (item_x, bar_top, right, bar_bottom),
+                    1.5 * scale,
+                    Rgba(pal.elapsed.0, pal.elapsed.1, pal.elapsed.2, opacity),
+                );
+            }
+            let target = value.unwrap_or_default().clamp(0.0, 100.0) as f32 / 100.0;
+            let fraction = row.and_then(|row| row.roll).map_or(target, |(from, t)| {
+                let start = from[id]
+                    .unwrap_or(value.unwrap_or_default())
+                    .clamp(0.0, 100.0) as f32
+                    / 100.0;
+                start + (target - start) * ease_out_cubic(t)
+            });
+            let right = item_x + (item_width as f32 * fraction).round() as i32;
+            paint_rect(
+                frame,
+                (item_x, bar_top, right, bar_bottom),
+                1.5 * scale,
+                Rgba(fill_color.0, fill_color.1, fill_color.2, opacity),
+            );
+        }
+        if vertical {
+            item_y += s(28.0);
+        } else {
+            item_x += s(38.0);
+        }
+    }
+}
+
+fn draw_forecast_spark(
+    frame: &mut Frame,
+    m: &Model,
+    x: i32,
+    y: i32,
+    scale: f32,
+    vertical: bool,
+    pal: &Palette,
+) {
+    let s = |value: f32| (value * scale).round() as i32;
+    let Some(row) = m.spark_row.as_ref() else {
+        return;
+    };
+    let busy = m.spark_busy && !m.spark_down;
+    let color = if m.spark_down {
+        pal.crit
+    } else if busy {
+        pal.spark
+    } else {
+        pal.label
+    };
+    let icon = draw_spark_mark(s(16.0));
+    let icon_x = if vertical {
+        x + (s(104.0) - s(16.0)) / 2
+    } else {
+        x
+    };
+    let icon_y = if vertical { y } else { (frame.h - s(16.0)) / 2 };
+    paint_mask(frame, icon_x, icon_y, s(16.0), &icon, color);
+    let value = if m.spark_down {
+        "down".to_owned()
+    } else if !busy {
+        "idle".to_owned()
+    } else {
+        format!("{:.0}", row.five.unwrap_or_default())
+    };
+    let value_x = if vertical { x } else { x + s(22.0) };
+    let value_y = if vertical {
+        y + s(24.0)
+    } else {
+        (frame.h - s(15.0)) / 2
+    };
+    let value_width = unsafe { measure_text_width(&value, s(13.0), true) };
+    let unit_width = unsafe { measure_text_width("t/s", s(10.0), false) };
+    unsafe {
+        paint_text(
+            frame,
+            &value,
+            RECT {
+                left: value_x,
+                top: value_y,
+                right: value_x + value_width,
+                bottom: value_y + s(15.0),
+            },
+            s(13.0),
+            true,
+            if busy { pal.value } else { color },
+            DT_LEFT,
+        );
+        if busy {
+            paint_text(
+                frame,
+                "t/s",
+                RECT {
+                    left: value_x + value_width + s(3.0),
+                    top: value_y,
+                    right: value_x + value_width + s(3.0) + unit_width,
+                    bottom: value_y + s(15.0),
+                },
+                s(10.0),
+                false,
+                pal.label,
+                DT_LEFT,
+            );
+        }
+    }
+    let chart_x = if vertical {
+        x + (s(104.0) - s(36.0)) / 2
+    } else if busy {
+        value_x + value_width + s(3.0) + unit_width + s(6.0)
+    } else {
+        value_x + value_width + s(6.0)
+    };
+    let chart_y = if vertical {
+        value_y + s(21.0)
+    } else {
+        (frame.h - s(18.0)) / 2
+    };
+    draw_strip_sparkline(
+        frame,
+        chart_x,
+        chart_y,
+        scale,
+        &m.spark_points,
+        busy,
+        m.spark_down,
+        m.spark_pulse_alpha,
+        pal,
+    );
+}
+
+fn draw_strip_sparkline(
+    frame: &mut Frame,
+    x: i32,
+    y: i32,
+    scale: f32,
+    points: &[f32],
+    busy: bool,
+    down: bool,
+    pulse: f32,
+    pal: &Palette,
+) {
+    let s = |value: f32| (value * scale).round() as i32;
+    let (width, height) = (s(36.0), s(18.0));
+    if !busy || down || points.len() < 2 {
+        paint_rect(
+            frame,
+            (x, y + height - s(1.0), x + width, y + height),
+            0.0,
+            pal.track,
+        );
+        return;
+    }
+    let peak = points.iter().copied().fold(1.0, f32::max);
+    let coords = points
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let px =
+                x + (index as f32 * (width - 1) as f32 / (points.len() - 1) as f32).round() as i32;
+            let py = y + s(17.0) - (value / peak * s(14.0) as f32).round() as i32;
+            (px, py)
+        })
+        .collect::<Vec<_>>();
+    for column in 0..width {
+        let position = column as f32 * (coords.len() - 1) as f32 / (width - 1).max(1) as f32;
+        let index = position.floor() as usize;
+        let t = position - index as f32;
+        let a = coords[index.min(coords.len() - 1)];
+        let b = coords[(index + 1).min(coords.len() - 1)];
+        let curve_y = a.1 as f32 + (b.1 - a.1) as f32 * t;
+        let px = x + column;
+        for py in curve_y.ceil() as i32..y + height {
+            let depth =
+                ((py as f32 - curve_y) / ((y + height) as f32 - curve_y).max(1.0)).clamp(0.0, 1.0);
+            over_pixel(
+                &mut frame.px[(py * frame.w + px) as usize],
+                pal.spark,
+                0.38 * (1.0 - depth) + 0.02 * depth,
+            );
+        }
+        for py in curve_y.round() as i32 - s(1.0)..=curve_y.round() as i32 + s(1.0) {
+            if py >= 0 && py < frame.h {
+                let coverage =
+                    (1.25 * scale + 0.5 - (py as f32 + 0.5 - curve_y).abs()).clamp(0.0, 1.0);
+                over_pixel(
+                    &mut frame.px[(py * frame.w + px) as usize],
+                    pal.spark,
+                    coverage,
+                );
+            }
+        }
+    }
+    let (last_x, last_y) = *coords.last().unwrap();
+    for py in last_y - s(5.0)..=last_y + s(5.0) {
+        for px in last_x - s(5.0)..=last_x + s(5.0) {
+            if px < 0 || px >= frame.w || py < 0 || py >= frame.h {
+                continue;
+            }
+            let distance = (((px - last_x).pow(2) + (py - last_y).pow(2)) as f32).sqrt();
+            if distance <= 3.85 * scale {
+                over_pixel(
+                    &mut frame.px[(py * frame.w + px) as usize],
+                    Rgba(pal.spark.0, pal.spark.1, pal.spark.2, 0.22 * pulse),
+                    1.0,
+                );
+            }
+            if distance <= 1.75 * scale {
+                over_pixel(&mut frame.px[(py * frame.w + px) as usize], pal.spark, 1.0);
+            }
+        }
+    }
 }
 
 struct Bar {
@@ -575,6 +1337,8 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         projected: [None; 3],
         text: [None, None, None],
         critical: [false; 3],
+        loading: false,
+        pulse_alpha: 1.0,
     }];
     let rows: &[Row] = if m.rows.is_empty() { &empty } else { &m.rows };
     // Vertical: every account in one column, one line per limit.
@@ -1264,19 +2028,18 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
 pub(crate) fn draw_codex_mark(size: i32) -> Vec<f32> {
     let mut out = vec![0.0; (size * size) as usize];
     let n = size as f32;
-    let points = [
-        (n * 0.14, n * 0.50),
-        (n * 0.32, n * 0.18),
-        (n * 0.68, n * 0.18),
-        (n * 0.86, n * 0.50),
-        (n * 0.68, n * 0.82),
-        (n * 0.32, n * 0.82),
-    ];
-    let stroke = (n * 0.105).clamp(1.35, 1.8);
+    let points = std::array::from_fn::<_, 6, _>(|index| {
+        let angle = (30.0 + index as f32 * 60.0).to_radians();
+        (
+            n * (0.5 + 0.43 * angle.cos()),
+            n * (0.5 + 0.43 * angle.sin()),
+        )
+    });
+    let stroke = (n * 0.085).max(1.3);
     let prompt = [
-        ((n * 0.37, n * 0.36), (n * 0.50, n * 0.50)),
-        ((n * 0.50, n * 0.50), (n * 0.37, n * 0.64)),
-        ((n * 0.55, n * 0.65), (n * 0.69, n * 0.65)),
+        ((n * 0.33, n * 0.38), (n * 0.45, n * 0.50)),
+        ((n * 0.45, n * 0.50), (n * 0.33, n * 0.62)),
+        ((n * 0.52, n * 0.63), (n * 0.67, n * 0.63)),
     ];
     let distance = |px: f32, py: f32, a: (f32, f32), b: (f32, f32)| {
         let vx = b.0 - a.0;
@@ -1312,14 +2075,13 @@ pub(crate) fn draw_codex_mark(size: i32) -> Vec<f32> {
     }
     out
 }
-fn draw_spark_mark(size: i32) -> Vec<f32> {
+pub(crate) fn draw_spark_mark(size: i32) -> Vec<f32> {
     let mut out = vec![0.0; (size * size) as usize];
     let n = size as f32;
-    let (left, top, right, bottom) = (n * 0.22, n * 0.22, n * 0.78, n * 0.78);
-    let radius = n * 0.11;
-    let stroke = (n * 0.085).max(1.0);
-    let pin_half = (n * 0.045).max(0.7);
-    let pin_length = n * 0.16;
+    let (left, top, right, bottom) = (n * 0.24, n * 0.24, n * 0.76, n * 0.76);
+    let radius = n * 0.08;
+    let stroke = (n * 0.09).max(1.3);
+    let pin_half = stroke * 0.5;
     for y in 0..size {
         for x in 0..size {
             let px = x as f32 + 0.5;
@@ -1335,16 +2097,16 @@ fn draw_spark_mark(size: i32) -> Vec<f32> {
                 (radius - stroke).max(0.0),
             );
             let mut coverage = (outer - inner).max(0.0);
-            for position in [0.39, 0.61] {
+            let center = rounded_rect_cov(px, py, n * 0.41, n * 0.41, n * 0.59, n * 0.59, n * 0.03);
+            coverage = coverage.max(center);
+            for position in [0.38, 0.62] {
                 let along = n * position;
                 let horizontal = py >= along - pin_half
                     && py <= along + pin_half
-                    && ((px >= left - pin_length && px <= left)
-                        || (px >= right && px <= right + pin_length));
+                    && ((px >= n * 0.06 && px <= left) || (px >= right && px <= n * 0.94));
                 let vertical = px >= along - pin_half
                     && px <= along + pin_half
-                    && ((py >= top - pin_length && py <= top)
-                        || (py >= bottom && py <= bottom + pin_length));
+                    && ((py >= n * 0.06 && py <= top) || (py >= bottom && py <= n * 0.94));
                 if horizontal || vertical {
                     coverage = 1.0;
                 }
@@ -1371,9 +2133,72 @@ mod tests {
             palette.crit
         );
     }
+
+    #[test]
+    fn strip_state_uses_pace_projection_and_critical_rules() {
+        assert_eq!(
+            strip_item_state(Some(42.0), Some(0.50), Some(84.0), false),
+            ItemState::Ok
+        );
+        assert_eq!(
+            strip_item_state(Some(62.0), Some(0.40), Some(88.0), false),
+            ItemState::Warn
+        );
+        assert_eq!(
+            strip_item_state(Some(40.0), Some(0.20), Some(100.0), false),
+            ItemState::Crit
+        );
+        assert_eq!(
+            strip_item_state(Some(96.0), Some(0.99), Some(97.0), false),
+            ItemState::Crit
+        );
+        assert_eq!(
+            strip_item_state(Some(20.0), Some(0.20), Some(20.0), true),
+            ItemState::Crit
+        );
+    }
+
+    #[test]
+    fn ok_strip_number_uses_text_while_fill_uses_provider_accent() {
+        for dark in [true, false] {
+            let palette = palette(dark);
+            assert_eq!(
+                number_color_for_state(ItemState::Ok, &palette),
+                palette.value
+            );
+            assert_eq!(
+                color_for_state(ItemState::Ok, palette.claude, &palette),
+                palette.claude
+            );
+            assert_eq!(
+                number_color_for_state(ItemState::Warn, &palette),
+                palette.warn
+            );
+            assert_eq!(
+                number_color_for_state(ItemState::Crit, &palette),
+                palette.crit
+            );
+        }
+    }
+
+    #[test]
+    fn segment_midpoints_follow_used_projected_elapsed_order() {
+        assert_eq!(segment_band(0, 12.0, 37.0, 62.0), SegmentBand::Used);
+        assert_eq!(segment_band(2, 12.0, 37.0, 62.0), SegmentBand::Projected);
+        assert_eq!(segment_band(7, 12.0, 37.0, 62.0), SegmentBand::Elapsed);
+        assert_eq!(segment_band(12, 12.0, 37.0, 62.0), SegmentBand::Track);
+    }
+
+    #[test]
+    fn ease_out_reaches_both_endpoints() {
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        assert!(ease_out_cubic(0.5) > 0.5);
+    }
 }
 
 fn rounded_rect_cov(x: f32, y: f32, l: f32, t: f32, r: f32, b: f32, rad: f32) -> f32 {
+    let rad = rad.min((r - l).max(0.0) * 0.5).min((b - t).max(0.0) * 0.5);
     let cx = x.clamp(l + rad, r - rad);
     let cy = y.clamp(t + rad, b - rad);
     let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() - rad;
@@ -1414,20 +2239,20 @@ fn draw_pixel_mark(size: i32) -> Vec<f32> {
 }
 
 /// Claude's asterisk-like mark: 12 rounded spokes of slightly varying length.
-fn draw_mark(size: i32) -> Vec<f32> {
+pub(crate) fn draw_mark(size: i32) -> Vec<f32> {
     const SS: i32 = 4; // supersampling
     let n = 12;
     let c = size as f32 / 2.0;
-    let r = size as f32 / 2.0;
-    let lens = [
-        1.0, 0.82, 0.95, 0.78, 1.0, 0.86, 0.92, 0.8, 0.98, 0.84, 0.9, 0.8,
-    ];
-    let half_w = (size as f32 * 0.052).max(0.8);
-    let spokes: Vec<(f32, f32)> = (0..n)
+    let stroke = (size as f32 * 0.10).max(1.4);
+    let spokes: Vec<((f32, f32), (f32, f32))> = (0..n)
         .map(|i| {
-            let a = (i as f32) * std::f32::consts::TAU / n as f32 + 0.13;
-            let len = (r - half_w) * lens[i as usize];
-            (a.cos() * len, a.sin() * len)
+            let angle = i as f32 * std::f32::consts::TAU / n as f32;
+            let inner = size as f32 * 0.10;
+            let outer = size as f32 * if i % 2 == 0 { 0.47 } else { 0.36 };
+            (
+                (angle.cos() * inner, angle.sin() * inner),
+                (angle.cos() * outer, angle.sin() * outer),
+            )
         })
         .collect();
     let mut out = vec![0f32; (size * size) as usize];
@@ -1438,13 +2263,13 @@ fn draw_mark(size: i32) -> Vec<f32> {
                 for sx in 0..SS {
                     let px = x as f32 + (sx as f32 + 0.5) / SS as f32 - c;
                     let py = y as f32 + (sy as f32 + 0.5) / SS as f32 - c;
-                    let inside = spokes.iter().any(|&(ex, ey)| {
-                        // distance from point to segment (0,0)-(ex,ey)
-                        let t = ((px * ex + py * ey) / (ex * ex + ey * ey)).clamp(0.0, 1.0);
-                        let (dx, dy) = (px - ex * t, py - ey * t);
-                        // taper: thinner toward the tip
-                        let hw = half_w * (1.0 + 0.25 * t);
-                        dx * dx + dy * dy <= hw * hw
+                    let inside = spokes.iter().any(|&(start, end)| {
+                        let vx = end.0 - start.0;
+                        let vy = end.1 - start.1;
+                        let t = (((px - start.0) * vx + (py - start.1) * vy) / (vx * vx + vy * vy))
+                            .clamp(0.0, 1.0);
+                        let (dx, dy) = (px - start.0 - vx * t, py - start.1 - vy * t);
+                        dx * dx + dy * dy <= (stroke * 0.5).powi(2)
                     });
                     if inside {
                         hits += 1;
@@ -1455,4 +2280,81 @@ fn draw_mark(size: i32) -> Vec<f32> {
         }
     }
     out
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CardGlyph {
+    Refresh,
+    Pin,
+    PinFilled,
+    Close,
+    Warning,
+}
+
+pub(crate) fn draw_card_glyph(size: i32, glyph: CardGlyph) -> Vec<f32> {
+    const SS: i32 = 4;
+    let scale = size as f32 / 14.0;
+    let line_distance = |px: f32, py: f32, a: (f32, f32), b: (f32, f32)| {
+        let (vx, vy) = (b.0 - a.0, b.1 - a.1);
+        let length = vx * vx + vy * vy;
+        let t = if length == 0.0 {
+            0.0
+        } else {
+            (((px - a.0) * vx + (py - a.1) * vy) / length).clamp(0.0, 1.0)
+        };
+        let (dx, dy) = (px - a.0 - t * vx, py - a.1 - t * vy);
+        (dx * dx + dy * dy).sqrt()
+    };
+    let mut output = vec![0.0; (size * size) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let mut hits = 0;
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let px = (x as f32 + (sx as f32 + 0.5) / SS as f32) / scale;
+                    let py = (y as f32 + (sy as f32 + 0.5) / SS as f32) / scale;
+                    let stroke = 0.65;
+                    let inside = match glyph {
+                        CardGlyph::Close => {
+                            line_distance(px, py, (3.5, 3.5), (10.5, 10.5)) <= stroke
+                                || line_distance(px, py, (10.5, 3.5), (3.5, 10.5)) <= stroke
+                        }
+                        CardGlyph::Pin | CardGlyph::PinFilled => {
+                            let circle = ((px - 7.0).powi(2) + (py - 5.0).powi(2)).sqrt();
+                            (matches!(glyph, CardGlyph::PinFilled) && circle <= 2.8)
+                                || (circle - 2.8).abs() <= stroke
+                                || line_distance(px, py, (7.0, 7.8), (7.0, 12.5)) <= stroke
+                        }
+                        CardGlyph::Warning => {
+                            let edges = [
+                                ((6.0, 1.5), (11.0, 10.5)),
+                                ((11.0, 10.5), (1.0, 10.5)),
+                                ((1.0, 10.5), (6.0, 1.5)),
+                            ];
+                            edges
+                                .iter()
+                                .any(|&(a, b)| line_distance(px, py, a, b) <= stroke)
+                                || line_distance(px, py, (6.0, 5.0), (6.0, 7.3)) <= stroke
+                                || ((px - 6.0).powi(2) + (py - 9.0).powi(2)).sqrt() <= 0.75
+                        }
+                        CardGlyph::Refresh => {
+                            let dx = px - 7.0;
+                            let dy = py - 7.0;
+                            let angle = dy.atan2(dx).to_degrees().rem_euclid(360.0);
+                            let arc = (dx * dx + dy * dy).sqrt();
+                            ((arc - 4.5).abs() <= stroke && (angle >= 45.0 || angle <= 315.0))
+                                || line_distance(px, py, (10.2, 1.4), (10.2, 3.9)) <= stroke
+                                || line_distance(px, py, (10.2, 3.9), (7.7, 3.9)) <= stroke
+                        }
+                    };
+                    if inside {
+                        hits += 1;
+                    }
+                }
+            }
+            output[(y * size + x) as usize] = hits as f32 / (SS * SS) as f32;
+        }
+    }
+    output
 }

@@ -50,8 +50,149 @@ pub fn run(output: &Path) -> Result<Vec<PathBuf>, String> {
         let path = output.join(format!("flyout-{theme}-150-wide.bmp"));
         write_bmp_u32(&path, width, height, &pixels).map_err(|error| error.to_string())?;
         written.push(path);
+
+        let path = output.join(format!("flyout-{theme}-150-states.bmp"));
+        write_flyout_states(&path, dark, now, &spark_points).map_err(|error| error.to_string())?;
+        written.push(path);
     }
+    let states_path = output.join("taskbar-dark-150-states.bmp");
+    write_taskbar_states(&states_path, &state, now, &spark_points)
+        .map_err(|error| error.to_string())?;
+    written.push(states_path);
     Ok(written)
+}
+
+fn write_flyout_states(path: &Path, dark: bool, now: i64, spark_points: &[f32]) -> io::Result<()> {
+    let state = fake_state(now);
+    let mut mixed = flyout_model(&state, now, spark_points);
+    for section in &mut mixed.sections {
+        match section.provider {
+            flyout::ProviderKind::Claude => {
+                if let Some(bar) = section.bars.first_mut() {
+                    bar.percent = 68.0;
+                    bar.elapsed = 40.0;
+                    bar.projected = 92.0;
+                    bar.ahead_by = 28.0;
+                    bar.full_at = None;
+                }
+            }
+            flyout::ProviderKind::Codex => {
+                section.stale = true;
+                section.as_of = "6 h old".into();
+            }
+            flyout::ProviderKind::Spark => {
+                section.error = Some("Down".into());
+            }
+        }
+    }
+    let empty = flyout::Snapshot {
+        updated: "Loading".into(),
+        sections: vec![
+            flyout::Section {
+                provider: flyout::ProviderKind::Claude,
+                title: "Claude".into(),
+                chip: "Loading".into(),
+                ..Default::default()
+            },
+            flyout::Section {
+                provider: flyout::ProviderKind::Codex,
+                title: "Codex · No readings yet".into(),
+                ..Default::default()
+            },
+        ],
+    };
+    let cards = [
+        flyout::render(&mixed, dark, 144, false),
+        flyout::render(&empty, dark, 144, false),
+    ];
+    let gap = 18;
+    let width = cards.iter().map(|card| card.0).max().unwrap_or(1);
+    let height = cards.iter().map(|card| card.1).sum::<i32>() + gap;
+    let background = if dark { 0xff1c1c1c } else { 0xfff3f3f3 };
+    let mut pixels = vec![background; (width * height) as usize];
+    let mut top = 0;
+    for (card_width, card_height, card_pixels) in cards {
+        for y in 0..card_height {
+            for x in 0..card_width {
+                pixels[((top + y) * width + x) as usize] =
+                    card_pixels[(y * card_width + x) as usize];
+            }
+        }
+        top += card_height + gap;
+    }
+    write_bmp_u32(path, width, height, &pixels)
+}
+
+fn write_taskbar_states(
+    path: &Path,
+    state: &Value,
+    now: i64,
+    spark_points: &[f32],
+) -> io::Result<()> {
+    let scale = 1.5;
+    let height = (48.0 * scale) as i32;
+    let base = taskbar_model(state, true, now, spark_points);
+    let mut models = Vec::new();
+    for kind in 0..6 {
+        let mut model = base.clone();
+        model.show_codex = false;
+        model.show_spark = false;
+        model.rows.truncate(1);
+        let row = model.rows.first_mut().expect("fake preview has Claude");
+        row.five = Some(match kind {
+            1 => 68.0,
+            2 => 98.0,
+            _ => 32.0,
+        });
+        row.week = Some(25.0);
+        row.fable = None;
+        row.pace = [Some(if kind == 1 { 0.40 } else { 0.55 }), Some(0.60), None];
+        row.projected = [Some(if kind == 2 { 100.0 } else { 72.0 }), Some(42.0), None];
+        row.stale = kind == 3;
+        row.loading = kind == 4;
+        row.pulse_alpha = 1.0;
+        if kind == 5 {
+            row.five = None;
+            row.week = None;
+        }
+        models.push(model);
+    }
+    for down in [false, true] {
+        let mut model = base.clone();
+        model.show_claude = false;
+        model.show_codex = false;
+        model.show_spark = true;
+        model.spark_busy = false;
+        model.spark_down = down;
+        if let Some(row) = &mut model.spark_row {
+            row.five = Some(0.0);
+            row.critical[0] = down;
+        }
+        models.push(model);
+    }
+    let frames = models
+        .iter()
+        .map(|model| render::render(model, height, scale, None))
+        .collect::<Vec<_>>();
+    let width = frames.iter().map(|frame| frame.w).max().unwrap_or(1) + 32;
+    let total_height = height * frames.len() as i32;
+    let mut pixels = vec![[0x1c, 0x1c, 0x1c, 255]; (width * total_height) as usize];
+    for (index, frame) in frames.iter().enumerate() {
+        let top = index as i32 * height + (height - frame.h) / 2;
+        for y in 0..frame.h {
+            for x in 0..frame.w {
+                let source = frame.px[(y * frame.w + x) as usize];
+                let alpha = source[3] as u16;
+                let destination = &mut pixels[((top + y) * width + 16 + x) as usize];
+                for channel in 0..3 {
+                    destination[channel] = (source[channel] as u16
+                        + destination[channel] as u16 * (255 - alpha) / 255)
+                        .min(255) as u8;
+                }
+            }
+        }
+    }
+    write_bmp(path, width, total_height, &pixels)
 }
 
 fn taskbar_model(state: &Value, dark: bool, now: i64, spark_points: &[f32]) -> render::Model {
@@ -90,6 +231,8 @@ fn taskbar_model(state: &Value, dark: bool, now: i64, spark_points: &[f32]) -> r
                 None,
             ],
             critical: [down, false, false],
+            loading: false,
+            pulse_alpha: 1.0,
         }
     });
     render::Model {
@@ -198,6 +341,8 @@ fn row_from_windows(windows: &Value, now: i64) -> render::Row {
         ],
         text: [None, None, None],
         critical: [false; 3],
+        loading: false,
+        pulse_alpha: 1.0,
     }
 }
 
