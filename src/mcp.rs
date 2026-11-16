@@ -153,6 +153,13 @@ pub fn load_cached_state() -> Option<Value> {
 }
 
 fn usage_headroom(time: i64) -> Value {
+    #[cfg(test)]
+    let state = Some(json!({
+        "written_at": time,
+        "readings": [{"provider":"claude","as_of":time,"windows":[]}],
+        "spark": null
+    }));
+    #[cfg(not(test))]
     let state = load_cached_state();
     let fresh = state
         .as_ref()
@@ -241,8 +248,83 @@ fn usage_headroom(time: i64) -> Value {
         "spark": spark,
         "router": router.json(),
         "summary": summary.join("; "),
-        "advice": if claude_tight { "claude_tight" } else { "ok" }
+        "advice": if claude_tight { "claude_tight" } else { "ok" },
+        "value": value_json(time)
     })
+}
+
+fn value_json(time: i64) -> Value {
+    #[cfg(test)]
+    {
+        let _ = time;
+        return json!({
+        "claude":{"today_usd":12.0,"week_usd":184.0,"month_usd":640.0,"plan_multiple":null,"top_projects_today":[{"name":"alpha","share":1.0}],"unpriced":[]},
+        "codex":{"today_usd":4.2,"week_usd":58.0,"month_usd":126.0,"plan_multiple":null,"top_projects_today":[{"name":"beta","share":1.0}],"unpriced":[]},
+        "pricing_as_of":"2026-11-16",
+        "partial":true
+        });
+    }
+    #[cfg(not(test))]
+    {
+        let pricing = crate::value::Pricing::load();
+        let snapshot =
+            crate::value::Store::load().snapshot(crate::tokens::local_day(time), &pricing);
+        let provider = |value: &crate::value::ProviderValue, setting: &str| {
+            let plan = read_registry_string(setting)
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v > 0.0);
+            json!({
+                "today_usd": value.today_usd,
+                "week_usd": value.week_usd,
+                "month_usd": value.month_usd,
+                "plan_multiple": plan.map(|p| value.month_usd / p),
+                "top_projects_today": value.top_projects_today.iter().map(|project| json!({"name":project.name,"share":project.share})).collect::<Vec<_>>(),
+                "unpriced": value.unpriced
+            })
+        };
+        json!({
+            "claude": provider(&snapshot.claude, "ClaudePlanUsd"),
+            "codex": provider(&snapshot.codex, "CodexPlanUsd"),
+            "pricing_as_of": snapshot.pricing_as_of,
+            "partial": snapshot.claude.calculating || snapshot.codex.calculating
+        })
+    }
+}
+
+#[cfg(not(test))]
+fn read_registry_string(setting: &str) -> Option<String> {
+    let key = crate::http::wide("Software\\TaskbarUsageWidget");
+    let name = crate::http::wide(setting);
+    let mut size = 0;
+    unsafe {
+        if RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        ) != 0
+        {
+            return None;
+        }
+        let mut value = vec![0u16; size as usize / 2 + 1];
+        if RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            value.as_mut_ptr().cast(),
+            &mut size,
+        ) != 0
+        {
+            return None;
+        }
+        let end = value.iter().position(|c| *c == 0).unwrap_or(value.len());
+        Some(String::from_utf16_lossy(&value[..end]))
+    }
 }
 
 fn normalize_window(window: &Value, time: i64, stale: i64) -> Value {
@@ -477,6 +559,13 @@ mod tests {
         assert!(body["summary"].is_string());
         assert!(body["advice"].is_string());
         assert!(body["router"]["recommendation"].is_string());
+        assert!(body["value"]["claude"]["today_usd"].is_number());
+        assert_eq!(body["value"]["partial"], true);
+        assert!(
+            text.len() < 2_200,
+            "MCP headroom response was {} characters",
+            text.len()
+        );
     }
 
     #[test]

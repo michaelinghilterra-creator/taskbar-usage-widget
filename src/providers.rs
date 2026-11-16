@@ -476,6 +476,16 @@ pub fn recent_codex_files() -> Vec<(PathBuf, SystemTime, u64)> {
         .collect()
 }
 
+pub fn value_codex_files(cutoff: SystemTime) -> Vec<(PathBuf, SystemTime, u64)> {
+    let mut files = Vec::new();
+    visit_rollouts(&codex_home().join("sessions"), cutoff, &mut files);
+    files.sort_by_key(|item| std::cmp::Reverse(item.0));
+    files
+        .into_iter()
+        .map(|(modified, size, path)| (path, modified, size))
+        .collect()
+}
+
 pub fn codex_files_signature() -> Vec<(PathBuf, u64, i64)> {
     recent_codex_files()
         .into_iter()

@@ -11,6 +11,7 @@ mod render;
 mod router;
 mod storage;
 mod tokens;
+mod value;
 
 use http::wide;
 use std::cell::{Cell, RefCell};
@@ -42,6 +43,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 const WM_APP_RESULT: u32 = WM_APP + 1;
 const WM_APP_CSWAP: u32 = WM_APP + 2; // claude-swap finished; lparam: Box<Result<(), String>>
 const WM_APP_PROVIDER: u32 = WM_APP + 3;
+const WM_APP_VALUE: u32 = WM_APP + 4;
 const T_LAYOUT: usize = 1; // keeps the widget attached and positioned
 const T_ROLL: usize = 5; // animation frames while numbers roll
 /// How long a changed number rolls.
@@ -51,6 +53,7 @@ const T_PROVIDER: usize = 4;
 const T_SPARK_PULSE: usize = 6;
 const T_FLYOUT: usize = 7;
 const T_ALERT_REMOVE: usize = 8;
+const T_VALUE_BACKFILL: usize = 9;
 const T_FETCH_BASE: usize = 1000; // + account id, one-shot: that account's next fetch
 
 const ID_REFRESH: usize = 1;
@@ -63,6 +66,7 @@ const ID_SPARK_ADDRESS: usize = 27;
 const ID_ALERTS: usize = 28;
 const ID_CARD_SHOW_LEFT: usize = 29;
 const ID_CONNECT_CLAUDE_CODE: usize = 30;
+const ID_PLAN_PRICES: usize = 31;
 const ID_AUTOSTART: usize = 3;
 const ID_EXIT: usize = 4;
 const ID_SHOW_LEFT: usize = 5;
@@ -277,6 +281,11 @@ struct State {
     token_tracker: std::sync::Arc<std::sync::Mutex<tokens::Tracker>>,
     token_totals: tokens::Totals,
     tokens_checked_at: i64,
+    token_worker_running: bool,
+    token_backfill_pending: bool,
+    value_snapshot: value::Snapshot,
+    claude_plan_usd: Option<f64>,
+    codex_plan_usd: Option<f64>,
     alerts: bool,
     alerted_periods: HashMap<String, i64>,
     high_windows: HashMap<String, (i64, bool)>,
@@ -307,6 +316,8 @@ thread_local! {
         spark: None, spark_startup_cached: false, spark_history: Vec::new(), history: None,
         token_tracker: std::sync::Arc::new(std::sync::Mutex::new(tokens::Tracker::default())),
         token_totals: tokens::Totals { claude: 0, claude_output: 0, codex: 0 }, tokens_checked_at: 0,
+        token_worker_running: false, token_backfill_pending: true,
+        value_snapshot: value::Snapshot::default(), claude_plan_usd: None, codex_plan_usd: None,
         alerts: true, alerted_periods: HashMap::new(), high_windows: HashMap::new(), spark_was_up: None,
         group_ranges: Vec::new(),
         fake_data: false, menu_tip: null_mut(),
@@ -447,6 +458,12 @@ fn main() {
             s.show_spark = read_setting("ShowSpark") != Some(0);
             s.alerts = read_setting("Alerts") != Some(0);
             s.spark_host = read_string_setting("SparkHost").unwrap_or_default();
+            s.claude_plan_usd = read_string_setting("ClaudePlanUsd")
+                .and_then(|v| v.parse().ok())
+                .filter(|v: &f64| *v > 0.0);
+            s.codex_plan_usd = read_string_setting("CodexPlanUsd")
+                .and_then(|v| v.parse().ok())
+                .filter(|v: &f64| *v > 0.0);
             s.cswap = find_cswap();
             s.rows_per_col = read_setting("AccountsPerColumn")
                 .filter(|v| (1..=render::MAX_ROWS_PER_COLUMN as u32).contains(v))
@@ -468,6 +485,7 @@ fn main() {
         SetTimer(ctl, T_PROVIDER, provider_poll_ms(), None);
         start_initial_claude_fetches();
         start_provider_fetch();
+        start_token_slice();
 
         let mut m: MSG = std::mem::zeroed();
         while GetMessageW(&mut m, null_mut(), 0, 0) > 0 {
@@ -1374,11 +1392,9 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                     )
                 })
             });
-            section.today = if s.tokens_checked_at == 0 {
-                "Counting tokens".into()
-            } else {
-                format!("{} tokens today", compact_number(s.token_totals.claude))
-            };
+            let provider_value = &s.value_snapshot.claude;
+            section.today = value_meta(provider_value, s.token_totals.claude, s.tokens_checked_at);
+            section.value = Some(value_block(provider_value, s.claude_plan_usd, t));
             if let Some(history) = &s.history {
                 section.chart = history
                     .samples("claude", "5h")
@@ -1417,11 +1433,9 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                     reading.error.clone()
                 }
             });
-            section.today = if s.tokens_checked_at == 0 {
-                "Counting tokens".into()
-            } else {
-                format!("{} today", compact_number(s.token_totals.codex))
-            };
+            let provider_value = &s.value_snapshot.codex;
+            section.today = value_meta(provider_value, s.token_totals.codex, s.tokens_checked_at);
+            section.value = Some(value_block(provider_value, s.codex_plan_usd, t));
             section.as_of = if reading.live {
                 "live".into()
             } else {
@@ -1577,6 +1591,57 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
         pulse_alpha: loading_pulse_alpha(),
         router_pill,
         router_good,
+    }
+}
+
+fn value_meta(value: &value::ProviderValue, tokens: u64, checked_at: i64) -> String {
+    if checked_at == 0 {
+        return "Calculating...".into();
+    }
+    format!(
+        "{} today · {} tokens",
+        dollar_copy(value.today_usd),
+        compact_number(tokens)
+    )
+}
+
+fn dollar_copy(value: f64) -> String {
+    if value < 10.0 {
+        format!("${value:.2}")
+    } else {
+        format!("${value:.0}")
+    }
+}
+
+fn value_block(
+    value: &value::ProviderValue,
+    plan_usd: Option<f64>,
+    time: i64,
+) -> flyout::ValueBlock {
+    let (_, month, day) = tokens::local_day(time);
+    let next = if month == 12 {
+        (tokens::local_day(time).0 + 1, 1)
+    } else {
+        (tokens::local_day(time).0, month + 1)
+    };
+    let days = value::days_from_civil(next.0, next.1, 1)
+        - value::days_from_civil(tokens::local_day(time).0, month, 1);
+    flyout::ValueBlock {
+        today_usd: value.today_usd,
+        week_usd: value.week_usd,
+        month_usd: value.month_usd,
+        projects: value
+            .top_projects_today
+            .iter()
+            .map(|p| flyout::ValueProject {
+                name: p.name.clone(),
+                share: p.share,
+            })
+            .collect(),
+        plan_usd,
+        month_elapsed: day as f64 / days as f64,
+        calculating: value.calculating,
+        unpriced: value.unpriced.clone(),
     }
 }
 
@@ -2129,7 +2194,11 @@ struct ProviderResult {
     codex_status: Option<providers::CodexFetchStatus>,
     codex_auth_mtime: Option<i64>,
     spark: Option<providers::SparkSnapshot>,
-    tokens: Option<tokens::Totals>,
+}
+
+struct TokenResult {
+    totals: tokens::Totals,
+    value: value::Snapshot,
 }
 
 fn retain_reading_on_failure(
@@ -2161,35 +2230,26 @@ fn retain_spark_on_failure(
 }
 
 fn start_provider_fetch() {
-    let (ctl, host, fake, old_codex, old_sig, due, suppress_auth, tracker, dirs, tokens_due) =
-        with(|s| {
-            let auth_mtime = providers::codex_auth_mtime();
-            let auth_changed =
-                s.codex_rejected_mtime.is_some() && auth_mtime != s.codex_rejected_mtime;
-            let due = !s.codex_fetching && (now() >= s.codex_next_fetch || auth_changed);
-            if due {
-                s.codex_fetching = true;
-            }
-            let suppress_auth = (now() < s.codex_auth_retry_at
-                && auth_mtime == s.codex_rejected_mtime)
-                .then_some(auth_mtime)
-                .flatten();
-            (
-                s.ctl as isize,
-                s.spark_host.clone(),
-                s.fake_data,
-                s.codex.clone(),
-                s.codex_sig.clone(),
-                due,
-                suppress_auth,
-                s.token_tracker.clone(),
-                s.accounts
-                    .iter()
-                    .map(|account| account.dir.clone())
-                    .collect::<Vec<_>>(),
-                now() - s.tokens_checked_at >= 60,
-            )
-        });
+    let (ctl, host, fake, old_codex, old_sig, due, suppress_auth) = with(|s| {
+        let auth_mtime = providers::codex_auth_mtime();
+        let auth_changed = s.codex_rejected_mtime.is_some() && auth_mtime != s.codex_rejected_mtime;
+        let due = !s.codex_fetching && (now() >= s.codex_next_fetch || auth_changed);
+        if due {
+            s.codex_fetching = true;
+        }
+        let suppress_auth = (now() < s.codex_auth_retry_at && auth_mtime == s.codex_rejected_mtime)
+            .then_some(auth_mtime)
+            .flatten();
+        (
+            s.ctl as isize,
+            s.spark_host.clone(),
+            s.fake_data,
+            s.codex.clone(),
+            s.codex_sig.clone(),
+            due,
+            suppress_auth,
+        )
+    });
     std::thread::spawn(move || {
         let t = now();
         let signature = providers::codex_files_signature();
@@ -2257,14 +2317,6 @@ fn start_provider_fetch() {
         } else {
             Some(providers::fetch_spark(&host, t))
         };
-        let tokens = tokens_due
-            .then(|| {
-                tracker
-                    .lock()
-                    .ok()
-                    .map(|mut tracker| tracker.poll(&dirs, t))
-            })
-            .flatten();
         let msg = Box::new(ProviderResult {
             codex,
             codex_sig: signature,
@@ -2272,7 +2324,6 @@ fn start_provider_fetch() {
             codex_status,
             codex_auth_mtime,
             spark,
-            tokens,
         });
         unsafe {
             PostMessageW(
@@ -2283,6 +2334,75 @@ fn start_provider_fetch() {
             );
         }
     });
+}
+
+fn start_token_slice() {
+    let job = with(|s| {
+        let due = s.token_backfill_pending || now() - s.tokens_checked_at >= 60;
+        if s.token_worker_running || !due {
+            return None;
+        }
+        s.token_worker_running = true;
+        Some((
+            s.ctl as isize,
+            s.token_tracker.clone(),
+            s.accounts
+                .iter()
+                .map(|account| account.dir.clone())
+                .collect::<Vec<_>>(),
+        ))
+    });
+    let Some((ctl, tracker, dirs)) = job else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let t = now();
+        let result = tracker.lock().ok().map(|mut tracker| {
+            let totals = tracker.poll(&dirs, t);
+            TokenResult {
+                totals,
+                value: tracker.value_snapshot(),
+            }
+        });
+        if let Some(result) = result {
+            unsafe {
+                PostMessageW(
+                    ctl as HWND,
+                    WM_APP_VALUE,
+                    0,
+                    Box::into_raw(Box::new(result)) as LPARAM,
+                );
+            }
+        } else {
+            unsafe { PostMessageW(ctl as HWND, WM_APP_VALUE, 1, 0) };
+        }
+    });
+}
+
+fn on_token_result(result: Option<TokenResult>) {
+    let (ctl, partial) = with(|s| {
+        s.token_worker_running = false;
+        if let Some(result) = result {
+            s.token_totals = result.totals;
+            s.tokens_checked_at = now();
+            s.token_backfill_pending =
+                result.value.claude.calculating || result.value.codex.calculating;
+            s.value_snapshot = result.value;
+            persist_state(s, now());
+            s.rendered = None;
+        }
+        (s.ctl, s.token_backfill_pending)
+    });
+    unsafe {
+        if partial {
+            SetTimer(ctl, T_VALUE_BACKFILL, 1000, None);
+        } else {
+            KillTimer(ctl, T_VALUE_BACKFILL);
+        }
+        if flyout::is_open() {
+            update_flyout();
+        }
+    }
 }
 
 fn claude_readings(s: &State, t: i64) -> Vec<providers::Reading> {
@@ -2447,10 +2567,6 @@ fn on_provider_result(mut r: ProviderResult) {
         s.spark = r.spark;
         if spark_fresh {
             s.spark_startup_cached = false;
-        }
-        if let Some(tokens) = r.tokens {
-            s.token_totals = tokens;
-            s.tokens_checked_at = now();
         }
         if let Some(sp) = &s.spark {
             s.spark_history.push((sp.fetched_at, sp.tok_s, sp.gpu_util));
@@ -2676,6 +2792,170 @@ fn open_url(url: &str) {
 }
 
 thread_local! { static SPARK_DIALOG: RefCell<(String,Option<String>)> = const { RefCell::new((String::new(),None)) }; }
+thread_local! { static PLAN_DIALOG: RefCell<((String,String),Option<(String,String)>)> = const { RefCell::new(((String::new(),String::new()),None)) }; }
+
+unsafe extern "system" fn plan_dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, _: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            let values = PLAN_DIALOG.with(|x| x.borrow().0.clone());
+            SetDlgItemTextW(hwnd, 100, wide(&values.0).as_ptr());
+            SetDlgItemTextW(hwnd, 101, wide(&values.1).as_ptr());
+            1
+        }
+        WM_COMMAND if (wp & 0xffff) as usize == IDOK as usize => {
+            let read = |id| {
+                let mut b = [0u16; 64];
+                let n = GetDlgItemTextW(hwnd, id, b.as_mut_ptr(), b.len() as i32);
+                String::from_utf16_lossy(&b[..n as usize]).trim().to_owned()
+            };
+            let claude = read(100);
+            let codex = read(101);
+            let valid = |v: &str| v.is_empty() || v.parse::<f64>().is_ok_and(|n| n > 0.0);
+            if valid(&claude) && valid(&codex) {
+                PLAN_DIALOG.with(|x| x.borrow_mut().1 = Some((claude, codex)));
+                EndDialog(hwnd, IDOK as isize);
+            } else {
+                MessageBoxW(
+                    hwnd,
+                    w!("Enter a positive dollar amount, or leave the field empty."),
+                    w!("Plan prices"),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            1
+        }
+        WM_COMMAND if (wp & 0xffff) as usize == IDCANCEL as usize => {
+            EndDialog(hwnd, IDCANCEL as isize);
+            1
+        }
+        WM_CLOSE => {
+            EndDialog(hwnd, IDCANCEL as isize);
+            1
+        }
+        _ => 0,
+    }
+}
+
+fn prompt_plan_prices() -> Option<(String, String)> {
+    let current = with(|s| {
+        (
+            s.claude_plan_usd.map(|v| v.to_string()).unwrap_or_default(),
+            s.codex_plan_usd.map(|v| v.to_string()).unwrap_or_default(),
+        )
+    });
+    PLAN_DIALOG.with(|x| *x.borrow_mut() = (current, None));
+    let mut v = Vec::<u16>::new();
+    let d = |v: &mut Vec<u16>, x: u32| {
+        v.push(x as u16);
+        v.push((x >> 16) as u16)
+    };
+    let z = |v: &mut Vec<u16>, s: &str| {
+        v.extend(s.encode_utf16());
+        v.push(0)
+    };
+    d(
+        &mut v,
+        (WS_POPUP | WS_CAPTION | WS_SYSMENU) as u32 | DS_MODALFRAME as u32,
+    );
+    d(&mut v, 0);
+    v.extend([7, 10, 10, 210, 100]);
+    v.extend([0, 0]);
+    z(&mut v, "Plan prices");
+    let item = |v: &mut Vec<u16>,
+                style: u32,
+                x: u16,
+                y: u16,
+                cx: u16,
+                cy: u16,
+                id: u16,
+                class: u16,
+                title: &str| {
+        if v.len() % 2 != 0 {
+            v.push(0)
+        }
+        d(v, style);
+        d(v, 0);
+        v.extend([x, y, cx, cy, id, 0xffff, class]);
+        z(v, title);
+        v.push(0)
+    };
+    item(
+        &mut v,
+        (WS_CHILD | WS_VISIBLE) as u32,
+        8,
+        8,
+        194,
+        10,
+        110,
+        0x0082,
+        "Claude monthly plan USD",
+    );
+    item(
+        &mut v,
+        (WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP) as u32 | ES_AUTOHSCROLL as u32,
+        8,
+        21,
+        194,
+        14,
+        100,
+        0x0081,
+        "",
+    );
+    item(
+        &mut v,
+        (WS_CHILD | WS_VISIBLE) as u32,
+        8,
+        40,
+        194,
+        10,
+        111,
+        0x0082,
+        "Codex monthly plan USD",
+    );
+    item(
+        &mut v,
+        (WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP) as u32 | ES_AUTOHSCROLL as u32,
+        8,
+        53,
+        194,
+        14,
+        101,
+        0x0081,
+        "",
+    );
+    item(
+        &mut v,
+        (WS_CHILD | WS_VISIBLE | WS_TABSTOP) as u32 | BS_DEFPUSHBUTTON as u32,
+        92,
+        77,
+        52,
+        14,
+        IDOK as u16,
+        0x0080,
+        "OK",
+    );
+    item(
+        &mut v,
+        (WS_CHILD | WS_VISIBLE | WS_TABSTOP) as u32,
+        150,
+        77,
+        52,
+        14,
+        IDCANCEL as u16,
+        0x0080,
+        "Cancel",
+    );
+    unsafe {
+        DialogBoxIndirectParamW(
+            GetModuleHandleW(null()),
+            v.as_ptr() as *const DLGTEMPLATE,
+            with(|s| s.ctl),
+            Some(plan_dialog_proc),
+            0,
+        );
+    }
+    PLAN_DIALOG.with(|x| x.borrow_mut().1.take())
+}
 
 unsafe extern "system" fn spark_dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, _: LPARAM) -> isize {
     match msg {
@@ -2960,6 +3240,7 @@ unsafe fn show_menu() {
     AppendMenuW(menu, tick(ID_SHOW_SPARK), ID_SHOW_SPARK, w!("Show Spark"));
     AppendMenuW(menu, tick(ID_ALERTS), ID_ALERTS, w!("Alerts"));
     AppendMenuW(menu, MF_STRING, ID_SPARK_ADDRESS, w!("Spark address..."));
+    AppendMenuW(menu, MF_STRING, ID_PLAN_PRICES, w!("Plan prices..."));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_POPUP, sub as usize, w!("Update every"));
     AppendMenuW(
@@ -3194,6 +3475,7 @@ unsafe fn show_menu() {
         ID_REFRESH => {
             start_fetch_all();
             start_provider_fetch();
+            start_token_slice();
         }
         ID_SPARK_ADDRESS => {
             if let Some(host) = prompt_spark_address() {
@@ -3203,6 +3485,19 @@ unsafe fn show_menu() {
                 });
                 write_string_setting("SparkHost", &host);
                 start_provider_fetch();
+            }
+        }
+        ID_PLAN_PRICES => {
+            if let Some((claude, codex)) = prompt_plan_prices() {
+                write_string_setting("ClaudePlanUsd", &claude);
+                write_string_setting("CodexPlanUsd", &codex);
+                with(|s| {
+                    s.claude_plan_usd = claude.parse().ok();
+                    s.codex_plan_usd = codex.parse().ok();
+                });
+                if flyout::is_open() {
+                    update_flyout();
+                }
             }
         }
         ID_ADD_ACCOUNT => add_account(),
@@ -3592,7 +3887,12 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
                 T_PROVIDER => {
                     start_provider_fetch();
+                    start_token_slice();
                     SetTimer(hwnd, T_PROVIDER, provider_poll_ms(), None);
+                }
+                T_VALUE_BACKFILL => {
+                    KillTimer(hwnd, T_VALUE_BACKFILL);
+                    start_token_slice();
                 }
                 T_SPARK_PULSE => {
                     let busy = with(|s| s.spark.as_ref().is_some_and(|spark| spark.busy));
@@ -3690,6 +3990,15 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             on_provider_result(*r);
             0
         }
+        WM_APP_VALUE => {
+            let result = if lp == 0 {
+                None
+            } else {
+                Some(*Box::from_raw(lp as *mut TokenResult))
+            };
+            on_token_result(result);
+            0
+        }
         WM_APP_RESULT => {
             let r = Box::from_raw(lp as *mut FetchResult);
             on_result(*r);
@@ -3698,6 +4007,7 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         flyout::WM_REFRESH => {
             start_fetch_all();
             start_provider_fetch();
+            start_token_slice();
             0
         }
         flyout::WM_OPEN_PROVIDER => {

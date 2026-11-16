@@ -1,4 +1,4 @@
-use crate::{flyout, providers, render, storage};
+use crate::{flyout, providers, render};
 use serde_json::{json, Value};
 use std::fs;
 use std::io;
@@ -11,19 +11,13 @@ pub fn run(output: &Path) -> Result<Vec<PathBuf>, String> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let state = fs::read(storage::dir().join("state.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .unwrap_or_else(|| fake_state(now));
-    let mut spark_points = history_points(now, 1200);
-    if spark_points.len() < 3 && state["_preview_fake"].as_bool() == Some(true) {
-        spark_points = (0..=120)
-            .map(|index| {
-                let t = index as f32;
-                76.0 + 0.08 * t + 9.0 * (t / 15.0).sin() + 3.5 * (t / 5.5).sin()
-            })
-            .collect();
-    }
+    let state = fake_state(now);
+    let spark_points = (0..=120)
+        .map(|index| {
+            let t = index as f32;
+            76.0 + 0.08 * t + 9.0 * (t / 15.0).sin() + 3.5 * (t / 5.5).sin()
+        })
+        .collect::<Vec<_>>();
     let mut written = Vec::new();
 
     for (dark, theme) in [(true, "dark"), (false, "light")] {
@@ -444,13 +438,12 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
             });
         }
         if provider == "claude" {
-            section.today = token_text(state, true);
-            section.chart = history_values("claude", "5h", now - 86400);
-            if section.chart.len() < 3 && state["_preview_fake"].as_bool() == Some(true) {
-                section.chart = vec![18.0, 24.0, 31.0, 29.0, 43.0, 51.0, 62.0];
-            }
+            section.today = value_token_text(state, true);
+            section.value = preview_value_block(&state["value"]["claude"]);
+            section.chart = vec![18.0, 24.0, 31.0, 29.0, 43.0, 51.0, 62.0];
         } else {
-            section.today = token_text(state, false);
+            section.today = value_token_text(state, false);
+            section.value = preview_value_block(&state["value"]["codex"]);
             section.as_of = format!(
                 "as of {} ago",
                 short_age(now - reading["as_of"].as_i64().unwrap_or(now))
@@ -578,28 +571,43 @@ fn compact(value: u64) -> String {
     }
 }
 
-fn token_text(state: &Value, claude: bool) -> String {
-    if state["tokens"]["checked_at"].as_i64().unwrap_or(0) == 0 {
-        return "Counting tokens".into();
-    }
-    if claude {
-        format!(
-            "{} tokens today",
-            compact(state["tokens"]["claude"].as_u64().unwrap_or(0))
-        )
+fn value_token_text(state: &Value, claude: bool) -> String {
+    let provider = if claude { "claude" } else { "codex" };
+    let tokens = if claude {
+        state["tokens"]["claude"].as_u64().unwrap_or(0)
     } else {
-        format!(
-            "{} today",
-            compact(state["tokens"]["codex"].as_u64().unwrap_or(0))
-        )
-    }
+        state["tokens"]["codex"].as_u64().unwrap_or(0)
+    };
+    let usd = state["value"][provider]["today_usd"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let dollars = if usd < 10.0 {
+        format!("${usd:.2}")
+    } else {
+        format!("${usd:.0}")
+    };
+    format!("{dollars} today · {} tokens", compact(tokens))
 }
 
-fn history_points(now: i64, seconds: i64) -> Vec<f32> {
-    history_values("spark", "", now - seconds)
-        .into_iter()
-        .map(|value| value as f32)
-        .collect()
+fn preview_value_block(source: &Value) -> Option<flyout::ValueBlock> {
+    Some(flyout::ValueBlock {
+        today_usd: source["today_usd"].as_f64().unwrap_or(0.0),
+        week_usd: source["week_usd"].as_f64().unwrap_or(0.0),
+        month_usd: source["month_usd"].as_f64().unwrap_or(0.0),
+        projects: source["projects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|p| flyout::ValueProject {
+                name: p["name"].as_str().unwrap_or("other").to_owned(),
+                share: p["share"].as_f64().unwrap_or(0.0),
+            })
+            .collect(),
+        plan_usd: source["plan_usd"].as_f64(),
+        month_elapsed: 16.0 / 30.0,
+        calculating: false,
+        unpriced: Vec::new(),
+    })
 }
 
 fn preview_spark_samples(now: i64, points: &[f32]) -> Vec<(i64, f64)> {
@@ -608,27 +616,6 @@ fn preview_spark_samples(now: i64, points: &[f32]) -> Vec<(i64, f64)> {
         .iter()
         .enumerate()
         .map(|(index, value)| (first + index as i64 * 5, *value as f64))
-        .collect()
-}
-
-fn history_values(provider: &str, key: &str, cutoff: i64) -> Vec<f64> {
-    fs::read_to_string(storage::dir().join("history.jsonl"))
-        .ok()
-        .into_iter()
-        .flat_map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .filter(|entry| {
-            entry["p"].as_str() == Some(provider)
-                && entry["t"].as_i64().is_some_and(|time| time >= cutoff)
-                && (provider == "spark" || entry["k"].as_str() == Some(key))
-        })
-        .filter_map(|entry| {
-            if provider == "spark" {
-                entry["tok"].as_f64()
-            } else {
-                entry["v"].as_f64()
-            }
-        })
         .collect()
 }
 
@@ -656,7 +643,11 @@ fn fake_state(now: i64) -> Value {
                 {"name":"Chatterbox TTS","up":true,"running":1,"pending":0}
             ]
         },
-        "tokens":{"claude":1200000,"claude_output":84000,"codex":238000,"checked_at":now}
+        "tokens":{"claude":1200000,"claude_output":84000,"codex":238000,"checked_at":now},
+        "value":{
+            "claude":{"today_usd":12.0,"week_usd":184.0,"month_usd":640.0,"plan_usd":200.0,"projects":[{"name":"trajecktory","share":0.48},{"name":"taskbar-usage-widget","share":0.30},{"name":"other","share":0.22}]},
+            "codex":{"today_usd":4.2,"week_usd":58.0,"month_usd":126.0,"plan_usd":200.0,"projects":[{"name":"taskbar-usage-widget","share":0.55},{"name":"alpha","share":0.29},{"name":"other","share":0.16}]}
+        }
     })
 }
 

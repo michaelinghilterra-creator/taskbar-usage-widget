@@ -79,6 +79,24 @@ pub struct SparkStats {
 }
 
 #[derive(Clone, Default, PartialEq)]
+pub struct ValueProject {
+    pub name: String,
+    pub share: f64,
+}
+
+#[derive(Clone, Default, PartialEq)]
+pub struct ValueBlock {
+    pub today_usd: f64,
+    pub week_usd: f64,
+    pub month_usd: f64,
+    pub projects: Vec<ValueProject>,
+    pub plan_usd: Option<f64>,
+    pub month_elapsed: f64,
+    pub calculating: bool,
+    pub unpriced: Vec<String>,
+}
+
+#[derive(Clone, Default, PartialEq)]
 pub struct Section {
     pub provider: ProviderKind,
     pub title: String,
@@ -94,6 +112,7 @@ pub struct Section {
     pub spark: Option<SparkStats>,
     pub loading: bool,
     pub empty: bool,
+    pub value: Option<ValueBlock>,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -750,6 +769,20 @@ fn panel_height(section: &Section) -> f32 {
                 0.0
             }
     };
+    if section.value.is_some()
+        && !section.empty
+        && !section.loading
+        && section.provider != ProviderKind::Spark
+    {
+        let value = section.value.as_ref().unwrap();
+        body += 135.0
+            + if value.plan_usd.is_some() { 13.0 } else { 0.0 }
+            + if !value.unpriced.is_empty() {
+                13.0
+            } else {
+                0.0
+            };
+    }
     if section.error.is_some()
         && section.provider != ProviderKind::Spark
         && !section.bars.is_empty()
@@ -947,6 +980,7 @@ unsafe fn draw_e2_content(
     SetBkMode(dc, TRANSPARENT as i32);
 
     let f10 = make_font(10.0, FW_NORMAL as i32, scale);
+    let f95 = make_font(9.5, FW_NORMAL as i32, scale);
     let f105 = make_font(10.5, FW_NORMAL as i32, scale);
     let f11 = make_font(11.0, FW_NORMAL as i32, scale);
     let f12b = make_font(12.0, FW_SEMIBOLD as i32, scale);
@@ -1095,8 +1129,8 @@ unsafe fn draw_e2_content(
     for panel in &layout.panels {
         let section = &snapshot.sections[panel.index];
         draw_e2_panel(
-            dc, panel.rect, section, snapshot, palette, scale, f10, f105, f11, f12b, f13b, f20b,
-            f30b,
+            dc, panel.rect, section, snapshot, palette, scale, f95, f10, f105, f11, f12b, f13b,
+            f20b, f30b,
         );
     }
 
@@ -1111,7 +1145,7 @@ unsafe fn draw_e2_content(
         DIB_RGB_COLORS,
     );
     SelectObject(dc, old_bitmap);
-    for font in [f10, f105, f11, f12b, f13b, f14b, f20b, f30b] {
+    for font in [f95, f10, f105, f11, f12b, f13b, f14b, f20b, f30b] {
         DeleteObject(font);
     }
     DeleteObject(bitmap);
@@ -1126,6 +1160,7 @@ unsafe fn draw_e2_panel(
     snapshot: &Snapshot,
     palette: CardPalette,
     scale: f32,
+    f95: HFONT,
     f10: HFONT,
     f105: HFONT,
     f11: HFONT,
@@ -1182,15 +1217,11 @@ unsafe fn draw_e2_panel(
     } else {
         match section.provider {
             ProviderKind::Claude => section.today.clone(),
-            ProviderKind::Codex => [
-                section.chip.as_str(),
-                section.today.as_str(),
-                section.as_of.as_str(),
-            ]
-            .into_iter()
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join(" \u{00b7} "),
+            ProviderKind::Codex => [section.chip.as_str(), section.today.as_str()]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(" \u{00b7} "),
             ProviderKind::Spark => section.chip.clone(),
         }
     };
@@ -1361,6 +1392,26 @@ unsafe fn draw_e2_panel(
             body_y += s(12.0);
         }
     }
+    if let Some(value) = &section.value {
+        body_y += s(12.0);
+        draw_line(dc, left, body_y, right, body_y, palette.separator, s(1.0));
+        body_y += s(9.0);
+        draw_value_block(
+            dc,
+            left,
+            right,
+            &mut body_y,
+            value,
+            accent,
+            palette,
+            panel_fill,
+            scale,
+            f95,
+            f10,
+            f105,
+            f13b,
+        );
+    }
     if section.provider == ProviderKind::Claude {
         body_y += s(12.0);
         draw_line(dc, left, body_y, right, body_y, palette.separator, s(1.0));
@@ -1387,6 +1438,182 @@ unsafe fn draw_e2_panel(
             None,
             scale,
         );
+    }
+}
+
+fn dollar(value: f64) -> String {
+    if value < 10.0 {
+        format!("${value:.2}")
+    } else {
+        format!("${value:.0}")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_value_block(
+    dc: HDC,
+    left: i32,
+    right: i32,
+    top: &mut i32,
+    value: &ValueBlock,
+    accent: COLORREF,
+    palette: CardPalette,
+    background: COLORREF,
+    scale: f32,
+    f95: HFONT,
+    f10: HFONT,
+    f105: HFONT,
+    f13b: HFONT,
+) {
+    let s = |v: f32| (v * scale).round() as i32;
+    SelectObject(dc, f10);
+    draw_text(dc, left, *top, "API value", palette.muted);
+    if value.calculating {
+        draw_text_right(dc, right, *top, "Calculating...", palette.faint);
+    }
+    *top += s(15.0);
+    SelectObject(dc, f13b);
+    let today = dollar(value.today_usd);
+    let week = dollar(value.week_usd);
+    let month = dollar(value.month_usd);
+    draw_colored_runs_ellipsis(
+        dc,
+        left,
+        right,
+        *top - s(2.0),
+        *top + s(17.0),
+        &[
+            ("today ", palette.muted),
+            (&today, palette.text),
+            ("  ·  week ", palette.muted),
+            (&week, palette.text),
+            ("  ·  month ", palette.muted),
+            (&month, palette.text),
+        ],
+    );
+    *top += s(18.0);
+    SelectObject(dc, f95);
+    if let Some(plan) = value.plan_usd.filter(|p| *p > 0.0) {
+        let multiple = value.month_usd / plan;
+        let pace = if value.month_elapsed > 0.0 {
+            multiple / value.month_elapsed
+        } else {
+            multiple
+        };
+        let copy = if value.month_elapsed < 0.999 {
+            format!("about {multiple:.1}x your plan this month · on pace for about {pace:.1}x")
+        } else {
+            format!("about {multiple:.1}x your plan this month")
+        };
+        draw_text_rect(
+            dc,
+            RECT {
+                left,
+                top: *top,
+                right,
+                bottom: *top + s(13.0),
+            },
+            &copy,
+            palette.faint,
+            DT_LEFT,
+        );
+        *top += s(13.0);
+    }
+    if !value.unpriced.is_empty() {
+        draw_text_rect(
+            dc,
+            RECT {
+                left,
+                top: *top,
+                right,
+                bottom: *top + s(13.0),
+            },
+            &format!("unpriced: {}", value.unpriced.join(", ")),
+            palette.faint,
+            DT_LEFT,
+        );
+        *top += s(13.0);
+    }
+    SelectObject(dc, f10);
+    draw_text(dc, left, *top, "Today by project", palette.muted);
+    *top += s(15.0);
+    for (index, project) in value.projects.iter().take(3).enumerate() {
+        let share = (project.share * 100.0).round() as i32;
+        let share_copy = format!("{share}%");
+        SelectObject(dc, f105);
+        let share_width = text_width(dc, &share_copy);
+        draw_text_rect(
+            dc,
+            RECT {
+                left,
+                top: *top,
+                right: (right - share_width - s(8.0)).max(left),
+                bottom: *top + s(13.0),
+            },
+            &project.name,
+            palette.muted,
+            DT_LEFT,
+        );
+        draw_text_right(dc, right, *top, &share_copy, palette.faint);
+        *top += s(16.0);
+        fill_rounded(dc, left, *top, right, *top + s(4.0), s(2.0), palette.track);
+        let alpha = if index == 0 { 0.70 } else { 0.45 };
+        fill_rounded(
+            dc,
+            left,
+            *top,
+            left + ((right - left) as f64 * project.share.clamp(0.0, 1.0)).round() as i32,
+            *top + s(4.0),
+            s(2.0),
+            faded(accent, background, alpha),
+        );
+        *top += s(10.0);
+    }
+}
+
+unsafe fn draw_colored_runs_ellipsis(
+    dc: HDC,
+    left: i32,
+    right: i32,
+    top: i32,
+    bottom: i32,
+    runs: &[(&str, COLORREF)],
+) {
+    let mut x = left;
+    for (text, color) in runs {
+        if x >= right {
+            break;
+        }
+        let width = text_width(dc, text);
+        if x + width <= right {
+            draw_text_rect(
+                dc,
+                RECT {
+                    left: x,
+                    top,
+                    right: x + width,
+                    bottom,
+                },
+                text,
+                *color,
+                DT_LEFT,
+            );
+            x += width;
+        } else {
+            draw_text_rect(
+                dc,
+                RECT {
+                    left: x,
+                    top,
+                    right,
+                    bottom,
+                },
+                text,
+                *color,
+                DT_LEFT,
+            );
+            break;
+        }
     }
 }
 
