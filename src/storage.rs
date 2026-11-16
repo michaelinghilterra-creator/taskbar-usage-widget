@@ -121,7 +121,7 @@ impl History {
         Ok(())
     }
 
-    fn samples(&self, provider: &str, key: &str) -> Vec<(i64, f64, Option<i64>)> {
+    pub fn samples(&self, provider: &str, key: &str) -> Vec<(i64, f64, Option<i64>)> {
         self.entries
             .iter()
             .filter(|entry| {
@@ -187,6 +187,8 @@ pub fn write_state(
     spark: Option<&SparkSnapshot>,
     history: &History,
     now: i64,
+    tokens: (u64, u64, u64),
+    tokens_checked_at: i64,
 ) -> Result<(), String> {
     fs::create_dir_all(dir()).map_err(|error| error.to_string())?;
     let readings_json: Vec<Value> = readings
@@ -230,7 +232,13 @@ pub fn write_state(
     let bytes = serde_json::to_vec(&json!({
         "written_at": now,
         "readings": readings_json,
-        "spark": spark_json
+        "spark": spark_json,
+        "tokens": {
+            "claude": tokens.0,
+            "claude_output": tokens.1,
+            "codex": tokens.2,
+            "checked_at": tokens_checked_at
+        }
     }))
     .unwrap();
     let path = state_path();

@@ -1,13 +1,18 @@
 #![windows_subsystem = "windows"]
 
 mod api;
+mod flyout;
 mod http;
+mod mcp;
 mod providers;
+mod preview;
 mod render;
 mod storage;
+mod tokens;
 
 use http::wide;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +29,8 @@ use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows_sys::Win32::UI::Shell::{
     SHBrowseForFolderW, SHGetPathFromIDListW, ShellExecuteW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
-    BROWSEINFOW,
+    BROWSEINFOW, Shell_NotifyIconW, NOTIFYICONDATAW, NIF_ICON, NIF_INFO, NIIF_INFO, NIM_ADD,
+    NIM_DELETE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::core::w;
@@ -39,6 +45,8 @@ const ROLL_SECS: f32 = 0.45;
 const T_TICK: usize = 3; // refreshes tooltip countdowns
 const T_PROVIDER: usize = 4;
 const T_SPARK_PULSE: usize = 6;
+const T_FLYOUT: usize = 7;
+const T_ALERT_REMOVE: usize = 8;
 const T_FETCH_BASE: usize = 1000; // + account id, one-shot: that account's next fetch
 
 const ID_REFRESH: usize = 1;
@@ -48,6 +56,7 @@ const ID_SHOW_CLAUDE: usize = 24;
 const ID_SHOW_CODEX: usize = 25;
 const ID_SHOW_SPARK: usize = 26;
 const ID_SPARK_ADDRESS: usize = 27;
+const ID_ALERTS: usize = 28;
 const ID_AUTOSTART: usize = 3;
 const ID_EXIT: usize = 4;
 const ID_SHOW_LEFT: usize = 5;
@@ -178,6 +187,9 @@ struct State {
     accounts: Vec<Account>,
     next_id: u32,
     hover: bool,
+    hover_since: Option<Instant>,
+    leave_since: Option<Instant>,
+    last_flyout_draw: Option<Instant>,
     dark: bool,
     rendered: Option<RenderKey>,
     pos: (i32, i32, i32, i32),
@@ -222,6 +234,13 @@ struct State {
     spark: Option<providers::SparkSnapshot>,
     spark_history: Vec<(i64, f64, f64)>,
     history: Option<storage::History>,
+    token_tracker: std::sync::Arc<std::sync::Mutex<tokens::Tracker>>,
+    token_totals: tokens::Totals,
+    tokens_checked_at: i64,
+    alerts: bool,
+    alerted_periods: HashMap<String, i64>,
+    high_windows: HashMap<String, (i64, bool)>,
+    spark_was_up: Option<bool>,
     group_ranges: Vec<render::GroupRange>,
     /// Dev only: random usage instead of the API.
     fake_data: bool,
@@ -237,10 +256,15 @@ thread_local! {
     static ST: RefCell<State> = RefCell::new(State {
         ctl: null_mut(), widget: null_mut(), tip: null_mut(), taskbar: null_mut(),
         taskbar_created_msg: 0, accounts: Vec::new(), next_id: 0,
-        hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
+        hover: false, hover_since: None, leave_since: None, last_flyout_draw: None,
+        dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
         font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, ring_margin: DEFAULT_RING_MARGIN, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
-        show_claude: true, show_codex: true, show_spark: true, spark_host: String::new(), codex: None, codex_sig: Vec::new(), codex_checked_at: 0, spark: None, spark_history: Vec::new(), history: None, group_ranges: Vec::new(),
+        show_claude: true, show_codex: true, show_spark: true, spark_host: String::new(), codex: None, codex_sig: Vec::new(), codex_checked_at: 0, spark: None, spark_history: Vec::new(), history: None,
+        token_tracker: std::sync::Arc::new(std::sync::Mutex::new(tokens::Tracker::default())),
+        token_totals: tokens::Totals { claude: 0, claude_output: 0, codex: 0 }, tokens_checked_at: 0,
+        alerts: true, alerted_periods: HashMap::new(), high_windows: HashMap::new(), spark_was_up: None,
+        group_ranges: Vec::new(),
         fake_data: false, menu_tip: null_mut(),
         cswap: None, cswap_running: false,
     });
@@ -255,6 +279,26 @@ fn now() -> i64 {
 }
 
 fn main() {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    if arguments.iter().any(|argument| argument == "--mcp") {
+        mcp::run();
+        return;
+    }
+    if let Some(index) = arguments.iter().position(|argument| argument == "--preview") {
+        let Some(directory) = arguments.get(index + 1) else {
+            println!("--preview requires an output directory");
+            return;
+        };
+        match preview::run(Path::new(directory)) {
+            Ok(paths) => {
+                for path in paths {
+                    println!("{}", path.display());
+                }
+            }
+            Err(error) => println!("preview failed: {error}"),
+        }
+        return;
+    }
     unsafe {
         let m = CreateMutexW(null(), 0, w!("Local\\TaskbarUsageWidget.Singleton"));
         if GetLastError() == ERROR_ALREADY_EXISTS { CloseHandle(m); return; }
@@ -262,6 +306,7 @@ fn main() {
         CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
         let hinst = GetModuleHandleW(null());
         let cursor = LoadCursorW(null_mut(), IDC_ARROW);
+        flyout::register();
         for (name, proc_) in [
             (w!("TaskbarUsageCtl"), Some(ctl_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT)),
             (w!("TaskbarUsageWidget"), Some(widget_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT)),
@@ -322,6 +367,7 @@ fn main() {
             s.show_claude = read_setting("ShowClaude") != Some(0);
             s.show_codex = read_setting("ShowCodex") != Some(0);
             s.show_spark = read_setting("ShowSpark") != Some(0);
+            s.alerts = read_setting("Alerts") != Some(0);
             s.spark_host = read_string_setting("SparkHost").unwrap_or_default();
             s.cswap = find_cswap();
             s.rows_per_col = read_setting("AccountsPerColumn")
@@ -405,7 +451,28 @@ fn on_result(res: FetchResult) {
         } else {
             a.rate_limited = 0;
         }
-        let wait = if s.fake_data { FAKE_DATA_SECS } else { backoff_secs(interval, a.rate_limited) };
+        let mut wait = if s.fake_data {
+            FAKE_DATA_SECS
+        } else {
+            backoff_secs(interval, a.rate_limited)
+        };
+        if !s.fake_data && session_inactive() {
+            wait = wait.max(900);
+        }
+        let next_reset = a
+            .usage
+            .iter()
+            .flat_map(|usage| [&usage.five_hour, &usage.weekly, &usage.fable])
+            .flatten()
+            .filter_map(|limit| limit.resets_at)
+            .filter(|reset| *reset > now())
+            .min();
+        if let Some(reset) = next_reset {
+            let until = (reset - now()) as u32;
+            if until <= wait {
+                wait = until.saturating_add(30);
+            }
+        }
         Some((s.ctl, wait))
     });
     if let Some((ctl, secs)) = next {
@@ -417,6 +484,9 @@ fn on_result(res: FetchResult) {
     ensure_widget();
     update_tooltip();
     with(|s| persist_state(s,now()));
+    for notice in with(evaluate_alerts) {
+        show_alert(&notice);
+    }
 }
 
 /// Wait before the next fetch. Normally the user's interval. After rate-limit
@@ -452,11 +522,10 @@ fn ensure_widget() {
             if widget.is_null() {
                 return;
             }
-            let tip = create_tooltip(widget);
             with(|s| {
                 s.widget = widget;
                 s.taskbar = taskbar;
-                s.tip = tip;
+                s.tip = null_mut();
                 s.rendered = None;
                 s.pos = (0, 0, 0, 0);
             });
@@ -683,21 +752,6 @@ unsafe fn present(widget: HWND, f: &render::Frame) {
     DeleteDC(dc);
 }
 
-unsafe fn create_tooltip(widget: HWND) -> HWND {
-    let tip = CreateWindowExW(
-        WS_EX_TOPMOST, TOOLTIPS_CLASSW, null(),
-        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-        widget, null_mut(), GetModuleHandleW(null()), null(),
-    );
-    let mut text = wide("Claude usage");
-    let ti = tool_info(widget, text.as_mut_ptr());
-    SendMessageW(tip, TTM_ADDTOOLW, 0, &ti as *const _ as LPARAM);
-    SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 600);
-    SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP as usize, 30_000);
-    tip
-}
-
 fn tool_info(widget: HWND, text: *mut u16) -> TTTOOLINFOW {
     TTTOOLINFOW {
         cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
@@ -777,6 +831,184 @@ fn tooltip_text(s: &State) -> String {
     out
 }
 
+fn flyout_snapshot(s: &State) -> flyout::Snapshot {
+    let t = now();
+    let mut sections = Vec::new();
+    if s.show_claude {
+        for (index, reading) in claude_readings(s, t).into_iter().enumerate() {
+            let mut section = flyout::Section {
+                provider: flyout::ProviderKind::Claude,
+                title: "Claude".into(),
+                chip: if s.accounts.len() > 1 { format!("account {}", index + 1) } else { String::new() },
+                stale: reading.error.is_some() || t - reading.as_of > 600,
+                error: reading.error.clone(),
+                ..Default::default()
+            };
+            add_flyout_windows(&mut section, &reading, t);
+            section.today = if s.tokens_checked_at == 0 {
+                "Today: counting...".into()
+            } else {
+                format!("Today: {} tokens · {} out", compact_number(s.token_totals.claude), compact_number(s.token_totals.claude_output))
+            };
+            if let Some(history) = &s.history {
+                section.chart = history
+                    .samples("claude", "5h")
+                    .into_iter()
+                    .filter(|sample| sample.0 >= t - 86400)
+                    .map(|sample| sample.1)
+                    .collect();
+            }
+            sections.push(section);
+        }
+    }
+    if s.show_codex {
+        if let Some(reading) = &s.codex {
+            let mut section = flyout::Section {
+                provider: flyout::ProviderKind::Codex,
+                title: "Codex".into(),
+                chip: reading.plan_type.as_deref().map(title_case).unwrap_or_default(),
+                stale: reading.error.is_some() || t - reading.as_of > 21600,
+                error: reading.error.clone(),
+                ..Default::default()
+            };
+            add_flyout_windows(&mut section, reading, t);
+            section.today = if s.tokens_checked_at == 0 { "Today: counting...".into() } else { format!("Today: {} tokens", compact_number(s.token_totals.codex)) };
+            section.as_of = format!("as of {} ago", human_short(t - reading.as_of));
+            sections.push(section);
+        }
+    }
+    if s.show_spark {
+        let mut section = flyout::Section {
+            provider: flyout::ProviderKind::Spark,
+            title: "Spark".into(),
+            ..Default::default()
+        };
+        if let Some(spark) = &s.spark {
+            let endpoint = spark.endpoints.first();
+            section.chip = endpoint
+                .and_then(|value| value["model"].as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let running: i64 = spark
+                .endpoints
+                .iter()
+                .filter_map(|value| value["running"].as_i64())
+                .sum();
+            let waiting: i64 = spark
+                .endpoints
+                .iter()
+                .filter_map(|value| value["waiting"].as_i64())
+                .sum();
+            let peak = s
+                .spark_history
+                .iter()
+                .map(|sample| sample.1)
+                .fold(0.0f64, f64::max);
+            section.spark = Some(flyout::SparkStats {
+                tok_s: spark.tok_s, peak, running, waiting,
+                kv_pct: endpoint.and_then(|value| value["kv_pct"].as_f64()),
+                ttft_ms: endpoint.and_then(|value| value["ttft_ms"].as_f64().or_else(|| value["ttft"].as_f64())),
+                gpu_util: spark.gpu_util,
+                gpu_temp: spark.sys["gpu"]["temp"].as_f64(),
+                gpu_power: spark.sys["gpu"]["power"].as_f64(),
+                mem_pct: spark.sys["memory"]["pct"].as_f64(),
+                swap_pct: spark.sys["swap"]["pct"].as_f64(),
+                aux: spark.aux.iter().map(|service| flyout::AuxStatus {
+                    name: service["name"].as_str().unwrap_or("service").to_owned(),
+                    up: service["up"].as_bool().unwrap_or(false),
+                    busy: service["busy"].as_bool().unwrap_or(false),
+                }).collect(),
+            });
+            section.error = spark.error.clone();
+            section.stale = t - spark.fetched_at > 30;
+            section.chart = s.spark_history.iter().map(|sample| sample.1).collect();
+        } else {
+            section.error = Some("Not configured".into());
+        }
+        sections.push(section);
+    }
+    let newest = s
+        .accounts
+        .iter()
+        .filter_map(|account| account.last_ok)
+        .chain(s.codex.iter().map(|reading| reading.fetched_at))
+        .chain(s.spark.iter().map(|spark| spark.fetched_at))
+        .max()
+        .unwrap_or(t);
+    flyout::Snapshot {
+        sections,
+        updated: format!("updated {} ago", human_short(t - newest)),
+    }
+}
+
+fn add_flyout_windows(section: &mut flyout::Section, reading: &providers::Reading, t: i64) {
+    for window in &reading.windows {
+        let pace = providers::pace(window.percent, window.resets_at, window.window_secs, t, None);
+        let reset = window
+            .resets_at
+            .map(|at| local_time(at, !same_local_day(at, t)))
+            .unwrap_or_default();
+        section.bars.push(flyout::Bar {
+            label: window.label.clone(),
+            percent: window.percent,
+            elapsed: pace.elapsed_pct,
+            reset,
+            ahead_by: pace.ahead_by,
+            projected: pace.projected,
+            full_at: pace.full_at.map(|at| local_time(at, !same_local_day(at, t))),
+        });
+    }
+}
+
+fn compact_number(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn human_short(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds >= 3600 { format!("{} h", seconds / 3600) }
+    else if seconds >= 60 { format!("{} m", seconds / 60) }
+    else { format!("{} s", seconds) }
+}
+
+fn title_case(value: &str) -> String {
+    let mut chars = value.chars();
+    chars.next().map(|first| first.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+}
+
+fn same_local_day(left: i64, right: i64) -> bool {
+    let date = |unix: i64| unsafe {
+        let ticks = (unix + 11_644_473_600) as u64 * 10_000_000;
+        let file = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+        let mut utc = std::mem::zeroed();
+        let mut local = std::mem::zeroed();
+        FileTimeToSystemTime(&file, &mut utc);
+        SystemTimeToTzSpecificLocalTime(null(), &utc, &mut local);
+        (local.wYear, local.wMonth, local.wDay)
+    };
+    date(left) == date(right)
+}
+
+unsafe fn update_flyout() {
+    let (widget, dark, snapshot) = with(|state| {
+        (state.widget, state.dark, flyout_snapshot(state))
+    });
+    if widget.is_null() {
+        return;
+    }
+    let mut anchor: RECT = std::mem::zeroed();
+    GetWindowRect(widget, &mut anchor);
+    let ctl = with(|state| state.ctl);
+    flyout::show(&snapshot, anchor, dark, ctl);
+    with(|state| state.last_flyout_draw = Some(Instant::now()));
+}
+
 fn countdown(secs: i64) -> String {
     let m = (secs.max(0) + 59) / 60;
     let (d, h, mm) = (m / 1440, (m % 1440) / 60, m % 60);
@@ -789,7 +1021,7 @@ fn countdown(secs: i64) -> String {
     }
 }
 
-fn local_time(unix: i64, with_day: bool) -> String {
+pub(crate) fn local_time(unix: i64, with_day: bool) -> String {
     unsafe {
         let ft_val = (unix + 11_644_473_600) as u64 * 10_000_000;
         let ft = FILETIME { dwLowDateTime: ft_val as u32, dwHighDateTime: (ft_val >> 32) as u32 };
@@ -1111,10 +1343,11 @@ struct ProviderResult {
     codex_sig: Vec<(PathBuf, u64, i64)>,
     codex_checked: bool,
     spark: Option<providers::SparkSnapshot>,
+    tokens: Option<tokens::Totals>,
 }
 
 fn start_provider_fetch() {
-    let (ctl, host, fake, old_codex, old_sig, due) = with(|s| {
+    let (ctl, host, fake, old_codex, old_sig, due, tracker, dirs, tokens_due) = with(|s| {
         (
             s.ctl as isize,
             s.spark_host.clone(),
@@ -1122,6 +1355,9 @@ fn start_provider_fetch() {
             s.codex.clone(),
             s.codex_sig.clone(),
             now() - s.codex_checked_at >= 60,
+            s.token_tracker.clone(),
+            s.accounts.iter().map(|account| account.dir.clone()).collect::<Vec<_>>(),
+            now() - s.tokens_checked_at >= 60,
         )
     });
     std::thread::spawn(move || {
@@ -1141,11 +1377,15 @@ fn start_provider_fetch() {
         let spark = if host.is_empty() { None } else if fake {
             Some(providers::parse_spark(&serde_json::json!({"endpoints":[{"name":"dev","model":"local","engine":"dev","up":true,"tok_s":142.0,"running":1}],"sys":{"gpu":{"util":72.0}}}),t))
         } else { Some(providers::fetch_spark(&host,t)) };
+        let tokens = tokens_due
+            .then(|| tracker.lock().ok().map(|mut tracker| tracker.poll(&dirs, t)))
+            .flatten();
         let msg = Box::new(ProviderResult {
             codex,
             codex_sig: signature,
             codex_checked: due,
             spark,
+            tokens,
         });
         unsafe { PostMessageW(ctl as HWND,WM_APP_PROVIDER,0,Box::into_raw(msg) as LPARAM); }
     });
@@ -1168,17 +1408,27 @@ fn persist_state(s:&mut State,t:i64){
     if let Some(c)=&s.codex { readings.push(c.clone()); }
     if let Some(history) = &mut s.history {
         let _ = history.append(&readings, s.spark.as_ref(), t);
-        let _ = storage::write_state(&readings, s.spark.as_ref(), history, t);
+        let _ = storage::write_state(
+            &readings,
+            s.spark.as_ref(),
+            history,
+            t,
+            (s.token_totals.claude, s.token_totals.claude_output, s.token_totals.codex),
+            s.tokens_checked_at,
+        );
     }
 }
 
 fn on_provider_result(r:ProviderResult){
-    with(|s|{
+    let spark_notice = with(|s|{
         s.codex=Some(r.codex); s.codex_sig=r.codex_sig; if r.codex_checked{s.codex_checked_at=now();} s.spark=r.spark;
+        if let Some(tokens) = r.tokens { s.token_totals = tokens; s.tokens_checked_at = now(); }
         if let Some(sp)=&s.spark { s.spark_history.push((sp.fetched_at,sp.tok_s,sp.gpu_util)); }
         let cutoff=now()-600; s.spark_history.retain(|x|x.0>=cutoff);
         persist_state(s,now()); s.rendered=None;
+        spark_alert(s)
     });
+    if let Some(notice) = spark_notice { show_alert(&notice); }
     unsafe {
         let (ctl, busy) = with(|s| (s.ctl, s.spark.as_ref().is_some_and(|spark| spark.busy)));
         if busy {
@@ -1199,6 +1449,10 @@ fn spark_pulse_alpha() -> f32 {
 }
 
 fn provider_poll_ms() -> u32 {
+    if session_inactive() { 30_000 } else { 5_000 }
+}
+
+fn session_inactive() -> bool {
     unsafe {
         let desktop = windows_sys::Win32::System::StationsAndDesktops::OpenInputDesktop(
             0,
@@ -1218,8 +1472,92 @@ fn provider_poll_ms() -> u32 {
             && windows_sys::Win32::System::SystemInformation::GetTickCount()
                 .wrapping_sub(input.dwTime)
                 >= 10 * 60 * 1000;
-        if locked || idle { 30_000 } else { 5_000 }
+        locked || idle
     }
+}
+
+fn evaluate_alerts(s: &mut State) -> Vec<String> {
+    if !s.alerts {
+        return Vec::new();
+    }
+    let t = now();
+    let mut notices = Vec::new();
+    for reading in claude_readings(s, t).into_iter().chain(s.codex.iter().cloned()) {
+        let provider = match reading.provider {
+            providers::Provider::Claude => "Claude",
+            providers::Provider::Codex => "Codex",
+            providers::Provider::Spark => "Spark",
+        };
+        for window in reading.windows {
+            let reset = window.resets_at.unwrap_or(0);
+            let key = format!("{provider}:{}", window.key);
+            let pace = providers::pace(
+                window.percent,
+                window.resets_at,
+                window.window_secs,
+                t,
+                None,
+            );
+            let high = window.percent >= 90.0
+                && pace.full_at.zip(window.resets_at).is_some_and(|(full, end)| full < end);
+            let previous = s.high_windows.insert(key.clone(), (reset, high));
+            if high && s.alerted_periods.get(&key).copied() != Some(reset) {
+                notices.push(format!(
+                    "{provider} {} is at {:.0}% and may fill before reset.",
+                    window.label, window.percent
+                ));
+                s.alerted_periods.insert(key.clone(), reset);
+            }
+            if previous.is_some_and(|(old_reset, was_high)| was_high && old_reset != reset) {
+                notices.push(format!("{provider} {} has refilled.", window.label));
+            }
+        }
+    }
+    notices
+}
+
+fn spark_alert(s: &mut State) -> Option<String> {
+    if !s.alerts {
+        return None;
+    }
+    let up = s.spark.as_ref().is_some_and(|spark| spark.up && spark.error.is_none());
+    let old = s.spark_was_up.replace(up);
+    match (old, up) {
+        (Some(true), false) => Some("Spark is unreachable.".into()),
+        (Some(false), true) => Some("Spark is back up.".into()),
+        _ => None,
+    }
+}
+
+fn show_alert(message_text: &str) {
+    unsafe {
+        let ctl = with(|s| s.ctl);
+        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = ctl;
+        data.uID = 1;
+        data.uFlags = NIF_ICON | NIF_INFO;
+        data.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+        data.dwInfoFlags = NIIF_INFO;
+        copy_wide(&mut data.szInfoTitle, "Usage widget");
+        copy_wide(&mut data.szInfo, message_text);
+        Shell_NotifyIconW(NIM_ADD, &data);
+        SetTimer(ctl, T_ALERT_REMOVE, 10_000, None);
+    }
+}
+
+fn copy_wide<const N: usize>(destination: &mut [u16; N], text: &str) {
+    let source = wide(text);
+    let length = source.len().min(N).saturating_sub(1);
+    destination[..length].copy_from_slice(&source[..length]);
+}
+
+unsafe fn remove_alert() {
+    let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    data.hWnd = with(|s| s.ctl);
+    data.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, &data);
 }
 
 unsafe fn quit() {
@@ -1393,6 +1731,7 @@ unsafe fn show_menu() {
     AppendMenuW(menu, tick(ID_SHOW_CLAUDE), ID_SHOW_CLAUDE, w!("Show Claude"));
     AppendMenuW(menu, tick(ID_SHOW_CODEX), ID_SHOW_CODEX, w!("Show Codex"));
     AppendMenuW(menu, tick(ID_SHOW_SPARK), ID_SHOW_SPARK, w!("Show Spark"));
+    AppendMenuW(menu, tick(ID_ALERTS), ID_ALERTS, w!("Alerts"));
     AppendMenuW(menu, MF_STRING, ID_SPARK_ADDRESS, w!("Spark address..."));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_POPUP, sub as usize, w!("Update every"));
@@ -1535,6 +1874,7 @@ fn setting_checked(id: usize) -> Option<bool> {
             ID_SHOW_CLAUDE => s.show_claude,
             ID_SHOW_CODEX => s.show_codex,
             ID_SHOW_SPARK => s.show_spark,
+            ID_ALERTS => s.alerts,
             ID_RINGS => s.rings,
             ID_RING_TEXT => s.ring_text,
             ID_RING_COLOR_ONLY => s.ring_color_only,
@@ -1577,6 +1917,10 @@ fn apply_setting(id: usize) -> bool {
         ID_SHOW_CLAUDE | ID_SHOW_CODEX | ID_SHOW_SPARK => {
             let (name,on)=with(|s|match id {ID_SHOW_CLAUDE=>{s.show_claude=!s.show_claude;("ShowClaude",s.show_claude)},ID_SHOW_CODEX=>{s.show_codex=!s.show_codex;("ShowCodex",s.show_codex)},_=>{s.show_spark=!s.show_spark;("ShowSpark",s.show_spark)}});
             write_setting(name,on as u32); ensure_widget();
+        }
+        ID_ALERTS => {
+            let enabled = with(|s| { s.alerts = !s.alerts; s.alerts });
+            write_setting("Alerts", enabled as u32);
         }
         ID_AUTOSTART => set_autostart(!autostart_enabled()),
         ID_SHOW_LEFT => {
@@ -1827,6 +2171,41 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         KillTimer(hwnd, T_SPARK_PULSE);
                     }
                 }
+                T_FLYOUT => {
+                    let widget_hover = with(|s| s.hover);
+                    let flyout_hover = flyout::is_hovered();
+                    let pinned = flyout::is_pinned();
+                    if widget_hover || flyout_hover || pinned {
+                        with(|s| s.leave_since = None);
+                        let ready = with(|s| {
+                            pinned
+                                || flyout::is_open()
+                                || s.hover_since.is_some_and(|at| at.elapsed().as_millis() >= 350)
+                        });
+                        let redraw = with(|s| {
+                            s.last_flyout_draw
+                                .is_none_or(|at| at.elapsed().as_secs_f32() >= 1.0)
+                        });
+                        if ready && redraw {
+                            update_flyout();
+                        }
+                    } else {
+                        let close = with(|s| {
+                            let left = s.leave_since.get_or_insert_with(Instant::now);
+                            left.elapsed().as_millis() >= 400
+                        });
+                        if close {
+                            flyout::hide();
+                            if !flyout::is_open() {
+                                KillTimer(hwnd, T_FLYOUT);
+                            }
+                        }
+                    }
+                }
+                T_ALERT_REMOVE => {
+                    remove_alert();
+                    KillTimer(hwnd, T_ALERT_REMOVE);
+                }
                 T_TICK => {
                     update_tooltip();
                     // A window just reset: fetch now instead of waiting.
@@ -1882,6 +2261,11 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             on_result(*r);
             0
         }
+        flyout::WM_REFRESH => {
+            start_fetch_all();
+            start_provider_fetch();
+            0
+        }
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
             with(|s| s.dark = system_dark());
             ensure_widget();
@@ -1914,6 +2298,12 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_MOUSEMOVE => {
             if !with(|s| std::mem::replace(&mut s.hover, true)) {
+                with(|s| {
+                    s.hover_since = Some(Instant::now());
+                    s.leave_since = None;
+                });
+                let ctl = with(|s| s.ctl);
+                SetTimer(ctl, T_FLYOUT, 100, None);
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE,
@@ -1926,7 +2316,11 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             0
         }
         WM_MOUSELEAVE => {
-            with(|s| s.hover = false);
+            with(|s| {
+                s.hover = false;
+                s.hover_since = None;
+                s.leave_since = Some(Instant::now());
+            });
             ensure_widget();
             0
         }

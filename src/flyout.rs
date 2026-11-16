@@ -1,0 +1,970 @@
+use crate::http::wide;
+use std::cell::Cell;
+use std::ptr::{null, null_mut};
+use windows_sys::core::w;
+use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+pub const WM_REFRESH: u32 = WM_APP + 30;
+const CLASS: *const u16 = w!("TaskbarUsageFlyout");
+const WM_MOUSE_LEAVE_MSG: u32 = 0x02A3;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProviderKind {
+    #[default]
+    Claude,
+    Codex,
+    Spark,
+}
+
+#[derive(Clone, Default)]
+pub struct Bar {
+    pub label: String,
+    pub percent: f64,
+    pub elapsed: f64,
+    pub reset: String,
+    pub ahead_by: f64,
+    pub projected: f64,
+    pub full_at: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct AuxStatus {
+    pub name: String,
+    pub up: bool,
+    pub busy: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct SparkStats {
+    pub tok_s: f64,
+    pub peak: f64,
+    pub running: i64,
+    pub waiting: i64,
+    pub kv_pct: Option<f64>,
+    pub ttft_ms: Option<f64>,
+    pub gpu_util: f64,
+    pub gpu_temp: Option<f64>,
+    pub gpu_power: Option<f64>,
+    pub mem_pct: Option<f64>,
+    pub swap_pct: Option<f64>,
+    pub aux: Vec<AuxStatus>,
+}
+
+#[derive(Clone, Default)]
+pub struct Section {
+    pub provider: ProviderKind,
+    pub title: String,
+    pub chip: String,
+    pub bars: Vec<Bar>,
+    pub chart: Vec<f64>,
+    pub today: String,
+    pub as_of: String,
+    pub error: Option<String>,
+    pub stale: bool,
+    pub spark: Option<SparkStats>,
+}
+
+#[derive(Clone, Default)]
+pub struct Snapshot {
+    pub sections: Vec<Section>,
+    pub updated: String,
+}
+
+thread_local! {
+    static WINDOW: Cell<HWND> = const { Cell::new(null_mut()) };
+    static OWNER: Cell<HWND> = const { Cell::new(null_mut()) };
+    static HOVER: Cell<bool> = const { Cell::new(false) };
+    static PINNED: Cell<bool> = const { Cell::new(false) };
+}
+
+pub unsafe fn register() {
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(proc_),
+        hInstance: GetModuleHandleW(null()),
+        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+        lpszClassName: CLASS,
+        ..std::mem::zeroed()
+    };
+    RegisterClassW(&class);
+}
+
+pub fn is_hovered() -> bool {
+    HOVER.with(Cell::get)
+}
+pub fn is_pinned() -> bool {
+    PINNED.with(Cell::get)
+}
+pub fn is_open() -> bool {
+    WINDOW.with(|window| unsafe { !window.get().is_null() && IsWindowVisible(window.get()) != 0 })
+}
+pub unsafe fn hide() {
+    if !is_pinned() {
+        WINDOW.with(|window| ShowWindow(window.get(), SW_HIDE));
+    }
+}
+
+pub unsafe fn show(snapshot: &Snapshot, anchor: RECT, dark: bool, owner: HWND) {
+    let hwnd = WINDOW.with(|slot| {
+        let mut hwnd = slot.get();
+        if hwnd.is_null() || IsWindow(hwnd) == 0 {
+            hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                CLASS,
+                w!("Usage details"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            slot.set(hwnd);
+        }
+        hwnd
+    });
+    OWNER.with(|slot| slot.set(owner));
+    if hwnd.is_null() {
+        return;
+    }
+    let frame = render(snapshot, dark, GetDpiForWindow(owner).max(96), is_pinned());
+    present(hwnd, position(anchor, frame.0, frame.1), frame);
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+}
+
+unsafe fn position(anchor: RECT, width: i32, height: i32) -> POINT {
+    let monitor = MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST);
+    let mut info: MONITORINFO = std::mem::zeroed();
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    GetMonitorInfoW(monitor, &mut info);
+    let (work, screen) = (info.rcWork, info.rcMonitor);
+    let (mut x, mut y) = (anchor.left, anchor.top - height - 8);
+    if anchor.bottom <= work.top + 4 {
+        y = anchor.bottom + 8;
+    } else if anchor.right <= work.left + 4 {
+        x = anchor.right + 8;
+        y = anchor.top;
+    } else if anchor.left >= work.right - 4 {
+        x = anchor.left - width - 8;
+        y = anchor.top;
+    } else if anchor.top < screen.top + height {
+        y = anchor.bottom + 8;
+    }
+    POINT {
+        x: x.clamp(work.left, (work.right - width).max(work.left)),
+        y: y.clamp(work.top, (work.bottom - height).max(work.top)),
+    }
+}
+
+pub fn render(snapshot: &Snapshot, dark: bool, dpi: u32, pinned: bool) -> (i32, i32, Vec<u32>) {
+    let scale = dpi as f32 / 96.0;
+    let width = (360.0 * scale).round() as i32;
+    let sections: i32 = snapshot.sections.iter().map(section_height).sum();
+    let gaps = snapshot.sections.len().saturating_sub(1) as i32 * 15;
+    let height = ((16 + 28 + sections + gaps + 16) as f32 * scale).round() as i32;
+    let mut pixels = vec![0u32; (width * height) as usize];
+    let radius = (10.0 * scale) as i32;
+    let card = if dark { (32, 32, 34) } else { (248, 248, 250) };
+    let border = if dark { (72, 72, 76) } else { (205, 205, 210) };
+    for y in 0..height {
+        for x in 0..width {
+            if rounded(x, y, width, height, radius) {
+                let edge = !rounded(x - 1, y - 1, width - 2, height - 2, radius - 1);
+                let (red, green, blue) = if edge { border } else { card };
+                pixels[(y * width + x) as usize] =
+                    (247u32 << 24) | ((red as u32) << 16) | ((green as u32) << 8) | blue as u32;
+            }
+        }
+    }
+    unsafe { draw_content(&mut pixels, width, height, snapshot, dark, scale, pinned) };
+    (width, height, pixels)
+}
+
+fn section_height(section: &Section) -> i32 {
+    let mut height = 24 + section.bars.len() as i32 * 55;
+    height += match section.provider {
+        ProviderKind::Claude => 78,
+        ProviderKind::Codex => 20,
+        ProviderKind::Spark => 192,
+    };
+    if section.error.is_some() || section.stale {
+        height += 18;
+    }
+    height
+}
+
+fn rounded(x: i32, y: i32, width: i32, height: i32, radius: i32) -> bool {
+    if x < 0 || y < 0 || x >= width || y >= height {
+        return false;
+    }
+    let cx = if x < radius {
+        radius
+    } else if x >= width - radius {
+        width - radius - 1
+    } else {
+        x
+    };
+    let cy = if y < radius {
+        radius
+    } else if y >= height - radius {
+        height - radius - 1
+    } else {
+        y
+    };
+    (x - cx) * (x - cx) + (y - cy) * (y - cy) <= radius * radius
+}
+
+unsafe fn draw_content(
+    pixels: &mut [u32],
+    width: i32,
+    height: i32,
+    snapshot: &Snapshot,
+    dark: bool,
+    scale: f32,
+    pinned: bool,
+) {
+    let dc = CreateCompatibleDC(null_mut());
+    let mut bits = null_mut();
+    let info = bitmap_info(width, height);
+    let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u32>(), pixels.len());
+    let old_bitmap = SelectObject(dc, bitmap);
+    SetBkMode(dc, TRANSPARENT as i32);
+
+    let normal = make_font(12.0, FW_NORMAL as i32, scale);
+    let small = make_font(10.5, FW_NORMAL as i32, scale);
+    let semibold = make_font(13.0, FW_SEMIBOLD as i32, scale);
+    let header = make_font(14.0, FW_SEMIBOLD as i32, scale);
+    let big = make_font(17.0, FW_SEMIBOLD as i32, scale);
+    let text = if dark {
+        rgb(235, 235, 238)
+    } else {
+        rgb(30, 30, 34)
+    };
+    let muted = if dark {
+        rgb(164, 164, 172)
+    } else {
+        rgb(95, 95, 104)
+    };
+    let track = if dark {
+        rgb(66, 66, 72)
+    } else {
+        rgb(224, 224, 229)
+    };
+    let separator = if dark {
+        rgb(55, 55, 59)
+    } else {
+        rgb(220, 220, 224)
+    };
+    let tile = if dark {
+        rgb(42, 42, 46)
+    } else {
+        rgb(238, 238, 241)
+    };
+    let green = rgb(118, 185, 0);
+    let dim_green = if dark {
+        rgb(126, 174, 91)
+    } else {
+        rgb(65, 120, 28)
+    };
+    let amber = rgb(224, 148, 55);
+    let red = if dark {
+        rgb(255, 123, 114)
+    } else {
+        rgb(196, 43, 28)
+    };
+    let pad = (16.0 * scale) as i32;
+    let mut y = (14.0 * scale) as i32;
+
+    SelectObject(dc, header);
+    draw_text(dc, pad, y, "Usage", text);
+    SelectObject(dc, small);
+    let controls_left = width - pad - (50.0 * scale) as i32;
+    draw_text_right(dc, controls_left - 6, y + 2, &snapshot.updated, muted);
+    SelectObject(dc, normal);
+    draw_text(dc, controls_left, y, "↻", muted);
+    draw_pin(
+        dc,
+        width - pad - (13.0 * scale) as i32,
+        y + 1,
+        scale,
+        pinned,
+        muted,
+    );
+    y += (30.0 * scale) as i32;
+
+    for (index, section) in snapshot.sections.iter().enumerate() {
+        if index > 0 {
+            let line_y = y + (6.0 * scale) as i32;
+            draw_line(dc, pad, line_y, width - pad, line_y, separator, 1);
+            y += (15.0 * scale) as i32;
+        }
+        let accent = provider_accent(section.provider);
+        let dimmed = section.stale || section.error.is_some();
+        draw_provider_mark(
+            dc,
+            pad,
+            y + 1,
+            (14.0 * scale) as i32,
+            section.provider,
+            accent,
+        );
+        SelectObject(dc, semibold);
+        draw_text(
+            dc,
+            pad + (20.0 * scale) as i32,
+            y,
+            &section.title,
+            if dimmed { muted } else { text },
+        );
+        if !section.chip.is_empty() {
+            SelectObject(dc, small);
+            draw_chip(dc, width - pad, y - 1, &section.chip, scale, tile, muted);
+        }
+        y += (24.0 * scale) as i32;
+
+        for bar in &section.bars {
+            SelectObject(dc, normal);
+            draw_text(dc, pad, y, &bar.label, muted);
+            let reset = if bar.reset.is_empty() {
+                String::new()
+            } else {
+                format!(" · resets {}", bar.reset)
+            };
+            draw_text_right(dc, width - pad, y, &reset, muted);
+            let reset_width = text_width(dc, &reset);
+            SelectObject(dc, semibold);
+            draw_text_right(
+                dc,
+                width - pad - reset_width,
+                y,
+                &format!("{:.0}%", bar.percent),
+                if dimmed { muted } else { text },
+            );
+
+            let bar_top = y + (20.0 * scale) as i32;
+            let bar_height = (6.0 * scale).round() as i32;
+            let bar_width = width - 2 * pad;
+            fill_round(dc, pad, bar_top, bar_width, bar_height, track);
+            let fill_width =
+                ((bar_width as f64 * bar.percent.clamp(0.0, 100.0) / 100.0).round() as i32).max(2);
+            let fill = if dimmed {
+                muted
+            } else if bar.percent > 95.0 {
+                red
+            } else if bar.percent > 75.0 {
+                amber
+            } else {
+                accent
+            };
+            fill_round(dc, pad, bar_top, fill_width, bar_height, fill);
+            let tick_x = pad + (bar_width as f64 * bar.elapsed.clamp(0.0, 100.0) / 100.0) as i32;
+            draw_line(
+                dc,
+                tick_x,
+                bar_top - (3.0 * scale) as i32,
+                tick_x,
+                bar_top + bar_height + (3.0 * scale) as i32,
+                text,
+                (2.0 * scale).round() as i32,
+            );
+
+            SelectObject(dc, small);
+            let ahead = bar.ahead_by.round() as i64;
+            let (arrow, wording, color) = if ahead > 0 {
+                let ending = bar
+                    .full_at
+                    .as_ref()
+                    .map(|at| format!("empty ~{at}"))
+                    .unwrap_or_else(|| format!("ends near {:.0}%", bar.projected));
+                (
+                    "▲",
+                    format!("{ahead} ahead of pace · {ending}"),
+                    if bar.full_at.is_some() { red } else { amber },
+                )
+            } else {
+                (
+                    "▼",
+                    format!("{} under pace · ends near {:.0}%", -ahead, bar.projected),
+                    dim_green,
+                )
+            };
+            let forecast_y = bar_top + bar_height + (7.0 * scale) as i32;
+            draw_text(
+                dc,
+                pad,
+                forecast_y,
+                arrow,
+                if dimmed { muted } else { color },
+            );
+            draw_text(
+                dc,
+                pad + (13.0 * scale) as i32,
+                forecast_y,
+                &wording,
+                if dimmed { muted } else { color },
+            );
+            y += (55.0 * scale) as i32;
+        }
+
+        match section.provider {
+            ProviderKind::Claude => {
+                draw_area_chart(
+                    dc,
+                    &section.chart,
+                    pad,
+                    y,
+                    width - pad,
+                    y + (40.0 * scale) as i32,
+                    accent,
+                    tile,
+                    separator,
+                    true,
+                );
+                SelectObject(dc, small);
+                draw_text(dc, pad, y + (42.0 * scale) as i32, "24 h", muted);
+                draw_text_right(dc, width - pad, y + (42.0 * scale) as i32, "now", muted);
+                y += (58.0 * scale) as i32;
+                SelectObject(dc, normal);
+                draw_text(
+                    dc,
+                    pad,
+                    y,
+                    &section.today,
+                    if dimmed { muted } else { text },
+                );
+                y += (20.0 * scale) as i32;
+            }
+            ProviderKind::Codex => {
+                SelectObject(dc, normal);
+                draw_text(
+                    dc,
+                    pad,
+                    y,
+                    &section.today,
+                    if dimmed { muted } else { text },
+                );
+                draw_text_right(dc, width - pad, y, &section.as_of, muted);
+                y += (20.0 * scale) as i32;
+            }
+            ProviderKind::Spark => {
+                if let Some(stats) = &section.spark {
+                    draw_stat_grid(
+                        dc,
+                        stats,
+                        pad,
+                        y,
+                        width - pad,
+                        scale,
+                        tile,
+                        text,
+                        muted,
+                        big,
+                        small,
+                    );
+                    y += (106.0 * scale) as i32;
+                    draw_area_chart(
+                        dc,
+                        &section.chart,
+                        pad,
+                        y,
+                        width - pad,
+                        y + (44.0 * scale) as i32,
+                        accent,
+                        tile,
+                        separator,
+                        false,
+                    );
+                    y += (58.0 * scale) as i32;
+                    draw_aux(
+                        dc,
+                        &stats.aux,
+                        pad,
+                        y,
+                        width - pad,
+                        scale,
+                        tile,
+                        text,
+                        green,
+                        red,
+                        small,
+                    );
+                    y += (28.0 * scale) as i32;
+                }
+            }
+        }
+        if let Some(error) = &section.error {
+            SelectObject(dc, small);
+            draw_text(dc, pad, y, &format!("⚠ {error}"), muted);
+        } else if section.stale {
+            SelectObject(dc, small);
+            draw_text(dc, pad, y, "⚠ Data is stale", muted);
+        }
+    }
+
+    let mut read_info = info;
+    GetDIBits(
+        dc,
+        bitmap,
+        0,
+        height as u32,
+        pixels.as_mut_ptr().cast(),
+        &mut read_info,
+        DIB_RGB_COLORS,
+    );
+    for y in 0..height {
+        for x in 0..width {
+            if rounded(x, y, width, height, (10.0 * scale) as i32) {
+                pixels[(y * width + x) as usize] |= 247u32 << 24;
+            }
+        }
+    }
+    SelectObject(dc, old_bitmap);
+    for font in [normal, small, semibold, header, big] {
+        DeleteObject(font);
+    }
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+}
+
+fn bitmap_info(width: i32, height: i32) -> BITMAPINFO {
+    BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..unsafe { std::mem::zeroed() }
+        },
+        ..unsafe { std::mem::zeroed() }
+    }
+}
+
+unsafe fn make_font(size: f32, weight: i32, scale: f32) -> HFONT {
+    CreateFontW(
+        -(size * scale).round() as i32,
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET as u32,
+        OUT_DEFAULT_PRECIS as u32,
+        CLIP_DEFAULT_PRECIS as u32,
+        CLEARTYPE_QUALITY as u32,
+        DEFAULT_PITCH as u32,
+        wide("Segoe UI").as_ptr(),
+    )
+}
+unsafe fn draw_text(dc: HDC, x: i32, y: i32, value: &str, color: COLORREF) {
+    let v = wide(value);
+    SetTextColor(dc, color);
+    TextOutW(dc, x, y, v.as_ptr(), v.len().saturating_sub(1) as i32);
+}
+unsafe fn text_width(dc: HDC, value: &str) -> i32 {
+    let v = wide(value);
+    let mut s = SIZE { cx: 0, cy: 0 };
+    GetTextExtentPoint32W(dc, v.as_ptr(), v.len().saturating_sub(1) as i32, &mut s);
+    s.cx
+}
+unsafe fn draw_text_right(dc: HDC, right: i32, y: i32, value: &str, color: COLORREF) {
+    draw_text(dc, right - text_width(dc, value), y, value, color);
+}
+fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+unsafe fn draw_line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, color: COLORREF, width: i32) {
+    let pen = CreatePen(PS_SOLID, width.max(1), color);
+    let old = SelectObject(dc, pen);
+    MoveToEx(dc, x1, y1, null_mut());
+    LineTo(dc, x2, y2);
+    SelectObject(dc, old);
+    DeleteObject(pen);
+}
+unsafe fn fill_round(dc: HDC, x: i32, y: i32, width: i32, height: i32, color: COLORREF) {
+    let brush = CreateSolidBrush(color);
+    let ob = SelectObject(dc, brush);
+    let op = SelectObject(dc, GetStockObject(NULL_PEN));
+    RoundRect(dc, x, y, x + width, y + height, height, height);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(brush);
+}
+fn provider_accent(provider: ProviderKind) -> COLORREF {
+    match provider {
+        ProviderKind::Claude => rgb(217, 119, 87),
+        ProviderKind::Codex => rgb(76, 154, 255),
+        ProviderKind::Spark => rgb(118, 185, 0),
+    }
+}
+unsafe fn draw_chip(
+    dc: HDC,
+    right: i32,
+    y: i32,
+    value: &str,
+    scale: f32,
+    fill: COLORREF,
+    color: COLORREF,
+) {
+    let width = text_width(dc, value) + (12.0 * scale) as i32;
+    let height = (18.0 * scale) as i32;
+    fill_round(dc, right - width, y, width, height, fill);
+    draw_text(
+        dc,
+        right - width + (6.0 * scale) as i32,
+        y + 1,
+        value,
+        color,
+    );
+}
+
+unsafe fn draw_provider_mark(
+    dc: HDC,
+    x: i32,
+    y: i32,
+    size: i32,
+    provider: ProviderKind,
+    color: COLORREF,
+) {
+    let pen = CreatePen(PS_SOLID, (size as f32 / 8.0).round().max(1.0) as i32, color);
+    let old = SelectObject(dc, pen);
+    let c = POINT {
+        x: x + size / 2,
+        y: y + size / 2,
+    };
+    match provider {
+        ProviderKind::Claude => {
+            for (dx, dy) in [(0, 6), (6, 0), (4, 4), (4, -4)] {
+                MoveToEx(dc, c.x - dx, c.y - dy, null_mut());
+                LineTo(dc, c.x + dx, c.y + dy);
+            }
+        }
+        ProviderKind::Codex => {
+            let p = [
+                POINT { x: c.x - 6, y: c.y },
+                POINT {
+                    x: c.x - 3,
+                    y: c.y - 5,
+                },
+                POINT {
+                    x: c.x + 3,
+                    y: c.y - 5,
+                },
+                POINT { x: c.x + 6, y: c.y },
+                POINT {
+                    x: c.x + 3,
+                    y: c.y + 5,
+                },
+                POINT {
+                    x: c.x - 3,
+                    y: c.y + 5,
+                },
+                POINT { x: c.x - 6, y: c.y },
+            ];
+            Polyline(dc, p.as_ptr(), p.len() as i32);
+            MoveToEx(dc, c.x - 2, c.y - 2, null_mut());
+            LineTo(dc, c.x + 2, c.y + 2);
+            MoveToEx(dc, c.x + 2, c.y - 2, null_mut());
+            LineTo(dc, c.x - 2, c.y + 2);
+        }
+        ProviderKind::Spark => {
+            RoundRect(dc, x + 3, y + 3, x + size - 3, y + size - 3, 3, 3);
+            for o in [5, size - 5] {
+                MoveToEx(dc, x, y + o, null_mut());
+                LineTo(dc, x + 3, y + o);
+                MoveToEx(dc, x + size - 3, y + o, null_mut());
+                LineTo(dc, x + size, y + o);
+                MoveToEx(dc, x + o, y, null_mut());
+                LineTo(dc, x + o, y + 3);
+                MoveToEx(dc, x + o, y + size - 3, null_mut());
+                LineTo(dc, x + o, y + size);
+            }
+        }
+    }
+    SelectObject(dc, old);
+    DeleteObject(pen);
+}
+unsafe fn draw_pin(dc: HDC, x: i32, y: i32, scale: f32, pinned: bool, color: COLORREF) {
+    let pen = CreatePen(PS_SOLID, (1.3 * scale).round().max(1.0) as i32, color);
+    let brush = if pinned {
+        CreateSolidBrush(color)
+    } else {
+        GetStockObject(HOLLOW_BRUSH)
+    };
+    let op = SelectObject(dc, pen);
+    let ob = SelectObject(dc, brush);
+    let w = (10.0 * scale) as i32;
+    let h = (7.0 * scale) as i32;
+    Ellipse(dc, x, y, x + w, y + h);
+    MoveToEx(dc, x + w / 2, y + h, null_mut());
+    LineTo(dc, x + w / 2, y + (13.0 * scale) as i32);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    if pinned {
+        DeleteObject(brush);
+    }
+    DeleteObject(pen);
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_stat_grid(
+    dc: HDC,
+    s: &SparkStats,
+    left: i32,
+    top: i32,
+    right: i32,
+    scale: f32,
+    tile: COLORREF,
+    text: COLORREF,
+    muted: COLORREF,
+    big: HFONT,
+    small: HFONT,
+) {
+    let gap = (6.0 * scale) as i32;
+    let width = (right - left - 2 * gap) / 3;
+    let height = (48.0 * scale) as i32;
+    let v = [
+        (
+            "tok/s",
+            format!("{:.0}", s.tok_s),
+            format!("peak {:.0}", s.peak),
+        ),
+        (
+            "running / waiting",
+            format!("{} / {}", s.running, s.waiting),
+            String::new(),
+        ),
+        ("KV", percent(s.kv_pct), String::new()),
+        ("TTFT", unit(s.ttft_ms, "ms"), String::new()),
+        (
+            "GPU",
+            format!("{:.0}%", s.gpu_util),
+            format!("{} C · {} W", number(s.gpu_temp), number(s.gpu_power)),
+        ),
+        (
+            "Memory",
+            percent(s.mem_pct),
+            format!("swap {} %", number(s.swap_pct)),
+        ),
+    ];
+    for (i, (label, value, detail)) in v.iter().enumerate() {
+        let col = i % 3;
+        let row = i / 3;
+        let x = left + col as i32 * (width + gap);
+        let y = top + row as i32 * (height + gap);
+        fill_round(dc, x, y, width, height, tile);
+        SelectObject(dc, small);
+        draw_text(dc, x + (7.0 * scale) as i32, y + 4, label, muted);
+        SelectObject(dc, big);
+        draw_text(
+            dc,
+            x + (7.0 * scale) as i32,
+            y + (17.0 * scale) as i32,
+            value,
+            text,
+        );
+        if !detail.is_empty() {
+            SelectObject(dc, small);
+            draw_text_right(dc, x + width - 6, y + (33.0 * scale) as i32, detail, muted);
+        }
+    }
+}
+fn number(v: Option<f64>) -> String {
+    v.map(|n| format!("{n:.0}")).unwrap_or_else(|| "-".into())
+}
+fn percent(v: Option<f64>) -> String {
+    v.map(|n| format!("{n:.0}%")).unwrap_or_else(|| "-".into())
+}
+fn unit(v: Option<f64>, suffix: &str) -> String {
+    v.map(|n| format!("{n:.0} {suffix}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_aux(
+    dc: HDC,
+    aux: &[AuxStatus],
+    left: i32,
+    top: i32,
+    right: i32,
+    scale: f32,
+    fill: COLORREF,
+    text: COLORREF,
+    green: COLORREF,
+    red: COLORREF,
+    font: HFONT,
+) {
+    SelectObject(dc, font);
+    let mut x = left;
+    for service in aux {
+        let state = if !service.up {
+            "down"
+        } else if service.busy {
+            "busy"
+        } else {
+            "idle"
+        };
+        let label = format!("● {} {state}", service.name);
+        let width = text_width(dc, &label) + (12.0 * scale) as i32;
+        if x + width > right {
+            break;
+        }
+        fill_round(dc, x, top, width, (20.0 * scale) as i32, fill);
+        let color = if !service.up {
+            red
+        } else if service.busy {
+            green
+        } else {
+            text
+        };
+        draw_text(dc, x + (6.0 * scale) as i32, top + 2, &label, color);
+        x += width + (6.0 * scale) as i32;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_area_chart(
+    dc: HDC,
+    values: &[f64],
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    color: COLORREF,
+    background: COLORREF,
+    grid: COLORREF,
+    percent_scale: bool,
+) {
+    for step in 0..=2 {
+        let y = top + (bottom - top) * step / 2;
+        draw_line(dc, left, y, right, y, grid, 1);
+    }
+    for step in 0..=4 {
+        let x = left + (right - left) * step / 4;
+        draw_line(dc, x, top, x, bottom, grid, 1);
+    }
+    if values.len() < 3 {
+        return;
+    }
+    let peak = if percent_scale {
+        100.0
+    } else {
+        values.iter().copied().fold(1.0, f64::max)
+    };
+    let mut points = Vec::with_capacity(values.len() + 2);
+    points.push(POINT { x: left, y: bottom });
+    for (index, value) in values.iter().enumerate() {
+        points.push(POINT {
+            x: left + (right - left) * index as i32 / (values.len() - 1) as i32,
+            y: bottom - ((bottom - top) as f64 * value.max(0.0) / peak) as i32,
+        });
+    }
+    points.push(POINT {
+        x: right,
+        y: bottom,
+    });
+    let brush = CreateSolidBrush(blend_color(background, color, 0.25));
+    let ob = SelectObject(dc, brush);
+    let op = SelectObject(dc, GetStockObject(NULL_PEN));
+    Polygon(dc, points.as_ptr(), points.len() as i32);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(brush);
+    let line = &points[1..points.len() - 1];
+    let pen = CreatePen(PS_SOLID, 2, color);
+    let old = SelectObject(dc, pen);
+    Polyline(dc, line.as_ptr(), line.len() as i32);
+    SelectObject(dc, old);
+    DeleteObject(pen);
+}
+fn blend_color(bg: COLORREF, fg: COLORREF, a: f32) -> COLORREF {
+    let c = |s| {
+        let b = ((bg >> s) & 255u32) as f32;
+        let f = ((fg >> s) & 255u32) as f32;
+        (b * (1.0 - a) + f * a).round() as u32
+    };
+    c(0) | (c(8) << 8) | (c(16) << 16)
+}
+
+unsafe fn present(hwnd: HWND, point: POINT, frame: (i32, i32, Vec<u32>)) {
+    let (width, height, pixels) = frame;
+    let screen = GetDC(null_mut());
+    let dc = CreateCompatibleDC(screen);
+    let mut bits = null_mut();
+    let info = bitmap_info(width, height);
+    let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u32>(), pixels.len());
+    let old = SelectObject(dc, bitmap);
+    let size = SIZE {
+        cx: width,
+        cy: height,
+    };
+    let source = POINT { x: 0, y: 0 };
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    UpdateLayeredWindow(
+        hwnd, screen, &point, &size, dc, &source, 0, &blend, ULW_ALPHA,
+    );
+    SelectObject(dc, old);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    ReleaseDC(null_mut(), screen);
+}
+
+unsafe extern "system" fn proc_(hwnd: HWND, message: u32, _wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match message {
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_MOUSEMOVE => {
+            HOVER.with(|h| h.set(true));
+            let mut e = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut e);
+            0
+        }
+        WM_MOUSE_LEAVE_MSG => {
+            HOVER.with(|h| h.set(false));
+            0
+        }
+        WM_LBUTTONDOWN => {
+            let x = lp as i16 as i32;
+            let y = (lp >> 16) as i16 as i32;
+            let mut r: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut r);
+            if y < 38 && x > r.right - 50 {
+                PINNED.with(|p| p.set(!p.get()));
+            } else if y < 38 && is_pinned() {
+                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+            } else if y < 38 && x > r.right - 90 {
+                OWNER.with(|o| PostMessageW(o.get(), WM_REFRESH, 0, 0));
+            }
+            0
+        }
+        WM_DESTROY => {
+            WINDOW.with(|w| w.set(null_mut()));
+            0
+        }
+        _ => DefWindowProcW(hwnd, message, 0, lp),
+    }
+}

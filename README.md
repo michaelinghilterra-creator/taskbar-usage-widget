@@ -16,7 +16,7 @@ One small file (~450 KB). No installer, nothing else to download.
 - Always visible in the taskbar, not hidden in the tray.
 - Tiny: about 5 MB of memory and near-zero CPU.
 - Turns orange above 75% and red above 95%, like Claude Code.
-- Hover for reset times and details.
+- Hover for a live, pinnable details flyout with forecasts, token totals, and Spark telemetry.
 - Follows your light or dark Windows theme.
 - Multiple Claude Code accounts at once.
 - Customizable size, icon, labels and rings.
@@ -61,6 +61,14 @@ If you run Claude Code with another config folder (e.g. `CLAUDE_CONFIG_DIR=$HOME
 ## Privacy
 
 Claude usage is read from `api.anthropic.com` and `platform.claude.com`. Codex usage is read locally from only `token_count` events in `%CODEX_HOME%\sessions` (or `%USERPROFILE%\.codex\sessions`); conversation text is never copied. Spark stats are requested only from the LAN host you configure. The widget writes `%LOCALAPPDATA%\TaskbarUsageWidget\state.json` and `history.jsonl`, plus settings under `HKEY_CURRENT_USER\Software\TaskbarUsageWidget`. OAuth tokens are never logged or stored in those files. There are no analytics or update checks.
+
+MCP mode reads the widget's local `state.json`, local Codex rollout metadata, and the configured Spark host only. It never reads Claude credentials or refreshes Claude tokens, and it labels Claude logins as `account 1`, `account 2`, and so on instead of exposing email addresses or paths.
+
+## MCP setup
+
+```
+claude mcp add --scope user usage-widget -- "C:\path\taskbar-usage-widget.exe" --mcp
+```
 
 ## Uninstall
 

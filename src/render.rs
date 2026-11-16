@@ -8,7 +8,7 @@ use crate::http::wide;
 use windows_sys::Win32::Foundation::{RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::*;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgba(pub f32, pub f32, pub f32, pub f32);
 
 pub struct Palette {
@@ -218,6 +218,29 @@ struct Ring {
     pace: Option<f32>,
 }
 
+fn displayed_value_color(
+    provider_mark: u8,
+    value: Option<f64>,
+    critical: bool,
+    pace: Option<f32>,
+    projected: Option<f32>,
+    palette: &Palette,
+) -> Rgba {
+    if provider_mark == 2 {
+        return if critical { palette.crit } else { palette.value };
+    }
+    match (value, pace, projected) {
+        _ if critical => palette.crit,
+        (Some(_), _, Some(projected)) if projected >= 100.0 => palette.crit,
+        (Some(value), Some(elapsed), _)
+            if value >= 50.0 && value > elapsed as f64 * 100.0 + 10.0 =>
+        {
+            palette.warn
+        }
+        _ => value_color(value, palette),
+    }
+}
+
 struct Divider {
     x0: i32,
     x1: i32,
@@ -270,6 +293,7 @@ pub fn render(m: &Model, h: i32, scale: f32, vert: Option<i32>) -> Frame {
                 m.spark_down,
                 m.spark_pulse_alpha,
                 scale,
+                m.dark,
             );
             frames.push((Group::Spark, frame));
         }
@@ -295,7 +319,15 @@ struct Bar {
     color: Rgba,
 }
 
-fn decorate_spark(f: &mut Frame, points: &[f32], busy: bool, down: bool, pulse: f32, scale: f32) {
+fn decorate_spark(
+    f: &mut Frame,
+    points: &[f32],
+    busy: bool,
+    down: bool,
+    pulse: f32,
+    scale: f32,
+    dark: bool,
+) {
     let add = (44.0 * scale).round() as i32;
     let old = f.w;
     let mut px = vec![[0, 0, 0, 1]; ((old + add) * f.h) as usize];
@@ -305,7 +337,11 @@ fn decorate_spark(f: &mut Frame, points: &[f32], busy: bool, down: bool, pulse: 
         }
     }
     let alpha = if busy { pulse.clamp(0.45, 1.0) } else { 1.0 };
-    let color = if down { [28, 43, 196] } else { [0, 185, 118] };
+    let color = if down {
+        [28, 43, 196]
+    } else {
+        [0, 185, 118]
+    };
     let dot = [
         (color[0] as f32 * alpha) as u8,
         (color[1] as f32 * alpha) as u8,
@@ -320,13 +356,27 @@ fn decorate_spark(f: &mut Frame, points: &[f32], busy: bool, down: bool, pulse: 
             }
         }
     }
-    if !points.is_empty() {
-        let green = [0, 185, 118]; // premultiplied as BGRA by blend_pixel
-        let peak = points.iter().copied().fold(1.0f32, f32::max);
+    {
+        let line_color = color;
         let x0 = old + 12;
         let graph_width = (add - 15).max(1);
-        let baseline = f.h - 4;
-        let graph_height = (f.h - 8).max(1) as f32;
+        let graph_height = (15.0 * scale).round().max(8.0) as i32;
+        let graph_top = (f.h - graph_height) / 2;
+        let baseline = graph_top + graph_height;
+        let baseline_color = if dark { [72, 72, 72] } else { [205, 205, 205] };
+        for x in x0..=x0 + graph_width {
+            blend_pixel(
+                &mut px[(baseline * (old + add) + x) as usize],
+                baseline_color,
+                0.35,
+            );
+        }
+        if points.len() < 3 {
+            f.w = old + add;
+            f.px = px;
+            return;
+        }
+        let peak = points.iter().copied().fold(1.0f32, f32::max);
         let sample = |position: f32| {
             let last = points.len().saturating_sub(1);
             let index = position.floor() as usize;
@@ -352,7 +402,7 @@ fn decorate_spark(f: &mut Frame, points: &[f32], busy: bool, down: bool, pulse: 
                 dx as f32 * (points.len() - 1) as f32 / graph_width as f32
             };
             let value = sample(position);
-            curve.push(baseline as f32 - value / peak * graph_height);
+            curve.push(baseline as f32 - value / peak * graph_height as f32);
         }
 
         // Soft area fill, strongest at the curve and fading toward the baseline.
@@ -364,7 +414,7 @@ fn decorate_spark(f: &mut Frame, points: &[f32], busy: bool, down: bool, pulse: 
                 let fade = 1.0 - (y - top) as f32 / depth;
                 blend_pixel(
                     &mut px[(y * (old + add) + x) as usize],
-                    green,
+                    line_color,
                     0.025 + 0.15 * fade,
                 );
             }
@@ -381,7 +431,7 @@ fn decorate_spark(f: &mut Frame, points: &[f32], busy: bool, down: bool, pulse: 
                         .clamp(0.0, 1.0);
                     blend_pixel(
                         &mut px[(y * (old + add) + x) as usize],
-                        green,
+                        line_color,
                         coverage,
                     );
                 }
@@ -402,7 +452,7 @@ fn decorate_spark(f: &mut Frame, points: &[f32], busy: bool, down: bool, pulse: 
                         .clamp(0.0, 1.0);
                     blend_pixel(
                         &mut px[(y * (old + add) + x) as usize],
-                        green,
+                        line_color,
                         coverage,
                     );
                 }
@@ -696,17 +746,19 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                         segs.push(Seg { text: labels[ids[g]].clone(), bold: false, small: false, x: group_x[g], w: label_w[g], y0, y1, color: pal.label, blur: 0, slack: s(2.0) });
                     }
                     let dy = y0 + ((y1 - y0) - div_h) / 2;
-                    if !vertical {
+                    if !vertical && g + 1 < groups {
                         dividers.push(Divider { x0: div_x[g], x1: div_x[g] + div_w, y0: dy.max(0), y1: (dy + div_h).min(h) });
                     }
                     let content_x = group_x[g] + label_w[g] + gap_lv;
                     let pi = ids[g];
-                    let color = match (val, row.pace[pi], row.projected[pi]) {
-                        _ if row.critical[pi] => pal.crit,
-                        (Some(_),_,Some(p)) if p>=100.0 => pal.crit,
-                        (Some(v),Some(e),_) if v>=50.0 && v>e as f64*100.0+10.0 => pal.warn,
-                        _ => value_color(val,&pal),
-                    };
+                    let color = displayed_value_color(
+                        m.provider_mark,
+                        val,
+                        row.critical[pi],
+                        row.pace[pi],
+                        row.projected[pi],
+                        &pal,
+                    );
                     if m.rings {
                         // The ring shows the same quantity as the number.
                         let frac = |v: Option<f64>| {
@@ -957,7 +1009,12 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         // Provider mark.
         let iy = if vertical { pad_v } else { (h - icon) / 2 };
         let mark = match m.provider_mark { 1=>draw_codex_mark(icon),2=>draw_spark_mark(icon),_ if m.pixel_icon=>draw_pixel_mark(icon),_=>draw_mark(icon) };
-        let mark_color=match m.provider_mark{2=>Rgba(0.463,0.725,0.0,1.0),1=>RING_BLUE,_=>CLAUDE_ORANGE};
+        let mark_color=match m.provider_mark {
+            2 if m.spark_down => pal.crit,
+            2 => pal.label,
+            1 => RING_BLUE,
+            _ => CLAUDE_ORANGE,
+        };
         for y in 0..icon {
             for xx in 0..icon {
                 let cov = mark[(y * icon + xx) as usize];
@@ -1049,6 +1106,24 @@ fn draw_spark_mark(size: i32) -> Vec<f32> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spark_value_color_ignores_throughput_as_percent() {
+        let palette = palette(true);
+        assert_eq!(
+            displayed_value_color(2, Some(148.0), false, None, None, &palette),
+            palette.value
+        );
+        assert_eq!(
+            displayed_value_color(2, Some(148.0), true, None, None, &palette),
+            palette.crit
+        );
+    }
 }
 
 fn rounded_rect_cov(x: f32, y: f32, l: f32, t: f32, r: f32, b: f32, rad: f32) -> f32 {
