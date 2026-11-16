@@ -915,7 +915,12 @@ fn ensure_widget() {
                 show_claude: s.show_claude,
                 show_codex: s.show_codex,
                 show_spark: s.show_spark && !s.spark_host.is_empty(),
-                spark_points: s.spark_history.iter().map(|x| x.1 as f32).collect(),
+                spark_samples: s
+                    .spark_history
+                    .iter()
+                    .map(|sample| (sample.0, sample.1))
+                    .collect(),
+                spark_now: now(),
                 spark_busy: s.spark.as_ref().is_some_and(|x| x.busy),
                 spark_down: s.spark.as_ref().is_some_and(|x| x.error.is_some() || !x.up),
                 spark_pulse_alpha: spark_pulse_alpha(),
@@ -1303,7 +1308,12 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
             });
             section.error = spark.error.clone();
             section.stale = t - spark.fetched_at > 30;
-            section.chart = s.spark_history.iter().map(|sample| sample.1).collect();
+            section.spark_samples = s
+                .spark_history
+                .iter()
+                .map(|sample| (sample.0, sample.1))
+                .collect();
+            section.chart_end = t;
         } else {
             section.loading = !s.spark_host.is_empty();
             section.empty = s.spark_host.is_empty();

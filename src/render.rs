@@ -60,15 +60,15 @@ pub fn palette(dark: bool) -> Palette {
             claude: c(0xD97757, 1.0),
             codex: c(0x4C9AFF, 1.0),
             spark: c(0x76B900, 1.0),
-            card_background: c(0x1E1E21, 1.0),
-            card_border: c(0x323238, 1.0),
+            card_background: c(0x141416, 1.0),
+            card_border: c(0x2A2A30, 1.0),
             card_text: c(0xEDEDF0, 1.0),
-            panel: c(0x26262B, 1.0),
-            panel_border: c(0x2E2E33, 1.0),
+            panel: c(0x1C1C20, 1.0),
+            panel_border: c(0x26262B, 1.0),
             faint: c(0x6E6E77, 1.0),
-            meter_track: c(0x36363C, 1.0),
-            meter_elapsed: c(0x4C4C54, 1.0),
-            separator: c(0x34343A, 1.0),
+            meter_track: c(0x2E2E34, 1.0),
+            meter_elapsed: c(0x44444C, 1.0),
+            separator: c(0x2C2C32, 1.0),
             good: c(0x7EAE5B, 1.0),
             idle: c(0x8A8A93, 1.0),
         }
@@ -159,6 +159,140 @@ pub fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BucketSeries {
+    pub(crate) values: Vec<f64>,
+    pub(crate) first_bucket: usize,
+    pub(crate) total_buckets: usize,
+    pub(crate) filled_buckets: usize,
+}
+
+pub(crate) fn bucket_samples(
+    samples: &[(i64, f64)],
+    end: i64,
+    window_seconds: i64,
+    bucket_count: usize,
+) -> BucketSeries {
+    if bucket_count == 0 || window_seconds <= 0 {
+        return BucketSeries {
+            values: Vec::new(),
+            first_bucket: 0,
+            total_buckets: bucket_count,
+            filled_buckets: 0,
+        };
+    }
+    let start = end - window_seconds;
+    let mut sums = vec![0.0; bucket_count];
+    let mut counts = vec![0usize; bucket_count];
+    for &(time, value) in samples {
+        if time <= start || time > end {
+            continue;
+        }
+        let offset = time - start - 1;
+        let index = ((offset as i128 * bucket_count as i128) / window_seconds as i128)
+            .clamp(0, bucket_count.saturating_sub(1) as i128) as usize;
+        sums[index] += value.max(0.0);
+        counts[index] += 1;
+    }
+    let mut buckets = sums
+        .into_iter()
+        .zip(counts)
+        .map(|(sum, count)| (count > 0).then_some(sum / count.max(1) as f64))
+        .collect::<Vec<_>>();
+    let filled_buckets = buckets.iter().filter(|value| value.is_some()).count();
+    let Some(first_bucket) = buckets.iter().position(|value| value.is_some()) else {
+        return BucketSeries {
+            values: Vec::new(),
+            first_bucket: 0,
+            total_buckets: bucket_count,
+            filled_buckets: 0,
+        };
+    };
+    let last_bucket = buckets.iter().rposition(|value| value.is_some()).unwrap();
+    let mut previous = first_bucket;
+    for next in first_bucket + 1..=last_bucket {
+        if buckets[next].is_none() {
+            continue;
+        }
+        let start_value = buckets[previous].unwrap();
+        let end_value = buckets[next].unwrap();
+        let span = (next - previous) as f64;
+        for index in previous + 1..next {
+            let t = (index - previous) as f64 / span;
+            buckets[index] = Some(start_value + (end_value - start_value) * t);
+        }
+        previous = next;
+    }
+    BucketSeries {
+        values: buckets[first_bucket..=last_bucket]
+            .iter()
+            .map(|value| value.unwrap())
+            .collect(),
+        first_bucket,
+        total_buckets: bucket_count,
+        filled_buckets,
+    }
+}
+
+pub(crate) fn monotone_curve(values: &[f64], sample_count: usize) -> Vec<f64> {
+    if values.is_empty() || sample_count == 0 {
+        return Vec::new();
+    }
+    if values.len() == 1 || sample_count == 1 {
+        return vec![values[0].max(0.0); sample_count];
+    }
+    let n = values.len();
+    let deltas = values
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect::<Vec<_>>();
+    let mut tangents = vec![0.0; n];
+    tangents[0] = deltas[0];
+    tangents[n - 1] = deltas[n - 2];
+    for index in 1..n - 1 {
+        let before = deltas[index - 1];
+        let after = deltas[index];
+        tangents[index] = if before * after <= 0.0 {
+            0.0
+        } else {
+            2.0 * before * after / (before + after)
+        };
+    }
+    for index in 0..n - 1 {
+        let delta = deltas[index];
+        if delta == 0.0 {
+            tangents[index] = 0.0;
+            tangents[index + 1] = 0.0;
+            continue;
+        }
+        let alpha = tangents[index] / delta;
+        let beta = tangents[index + 1] / delta;
+        let magnitude = alpha * alpha + beta * beta;
+        if magnitude > 9.0 {
+            let scale = 3.0 / magnitude.sqrt();
+            tangents[index] = scale * alpha * delta;
+            tangents[index + 1] = scale * beta * delta;
+        }
+    }
+    (0..sample_count)
+        .map(|sample| {
+            let position = sample as f64 * (n - 1) as f64 / (sample_count - 1).max(1) as f64;
+            let index = position.floor().min((n - 2) as f64) as usize;
+            let t = (position - index as f64).clamp(0.0, 1.0);
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let value = (2.0 * t3 - 3.0 * t2 + 1.0) * values[index]
+                + (t3 - 2.0 * t2 + t) * tangents[index]
+                + (-2.0 * t3 + 3.0 * t2) * values[index + 1]
+                + (t3 - t2) * tangents[index + 1];
+            value.max(0.0).clamp(
+                values[index].min(values[index + 1]),
+                values[index].max(values[index + 1]),
+            )
+        })
+        .collect()
+}
+
 /// One account's numbers.
 #[derive(Clone)]
 pub struct Row {
@@ -227,7 +361,8 @@ pub struct Model {
     pub show_claude: bool,
     pub show_codex: bool,
     pub show_spark: bool,
-    pub spark_points: Vec<f32>,
+    pub spark_samples: Vec<(i64, f64)>,
+    pub spark_now: i64,
     pub spark_busy: bool,
     pub spark_down: bool,
     pub spark_pulse_alpha: f32,
@@ -423,7 +558,8 @@ pub fn render(m: &Model, h: i32, scale: f32, vert: Option<i32>) -> Frame {
             let mut frame = render_one(&model, h, scale, vert);
             decorate_spark(
                 &mut frame,
-                &m.spark_points,
+                &m.spark_samples,
+                m.spark_now,
                 m.spark_busy,
                 m.spark_down,
                 m.spark_pulse_alpha,
@@ -1006,7 +1142,8 @@ fn draw_forecast_spark(
         chart_x,
         chart_y,
         scale,
-        &m.spark_points,
+        &m.spark_samples,
+        m.spark_now,
         busy,
         m.spark_down,
         m.spark_pulse_alpha,
@@ -1019,7 +1156,8 @@ fn draw_strip_sparkline(
     x: i32,
     y: i32,
     scale: f32,
-    points: &[f32],
+    samples: &[(i64, f64)],
+    end: i64,
     busy: bool,
     down: bool,
     pulse: f32,
@@ -1027,7 +1165,7 @@ fn draw_strip_sparkline(
 ) {
     let s = |value: f32| (value * scale).round() as i32;
     let (width, height) = (s(36.0), s(18.0));
-    if !busy || down || points.len() < 2 {
+    if !busy || down || samples.len() < 2 {
         paint_rect(
             frame,
             (x, y + height - s(1.0), x + width, y + height),
@@ -1036,24 +1174,28 @@ fn draw_strip_sparkline(
         );
         return;
     }
-    let peak = points.iter().copied().fold(1.0, f32::max);
-    let coords = points
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let px =
-                x + (index as f32 * (width - 1) as f32 / (points.len() - 1) as f32).round() as i32;
-            let py = y + s(17.0) - (value / peak * s(14.0) as f32).round() as i32;
-            (px, py)
-        })
-        .collect::<Vec<_>>();
-    for column in 0..width {
-        let position = column as f32 * (coords.len() - 1) as f32 / (width - 1).max(1) as f32;
-        let index = position.floor() as usize;
-        let t = position - index as f32;
-        let a = coords[index.min(coords.len() - 1)];
-        let b = coords[(index + 1).min(coords.len() - 1)];
-        let curve_y = a.1 as f32 + (b.1 - a.1) as f32 * t;
+    let buckets = bucket_samples(samples, end, 600, 20);
+    if buckets.filled_buckets < 3 {
+        paint_rect(
+            frame,
+            (x, y + height - s(1.0), x + width, y + height),
+            0.0,
+            pal.track,
+        );
+        return;
+    }
+    let map_x = |bucket: usize| {
+        (bucket as f32 * (width - 1) as f32 / buckets.total_buckets.saturating_sub(1).max(1) as f32)
+            .round() as i32
+    };
+    let first_column = map_x(buckets.first_bucket);
+    let last_column = map_x(buckets.first_bucket + buckets.values.len() - 1);
+    let curve = monotone_curve(&buckets.values, (last_column - first_column + 1) as usize);
+    let peak = buckets.values.iter().copied().fold(1.0, f64::max);
+    for column in first_column..=last_column {
+        let curve_index = (column - first_column) as usize;
+        let curve_y =
+            y as f32 + s(17.0) as f32 - (curve[curve_index] / peak * s(14.0) as f64) as f32;
         let px = x + column;
         for py in curve_y.ceil() as i32..y + height {
             let depth =
@@ -1076,7 +1218,10 @@ fn draw_strip_sparkline(
             }
         }
     }
-    let (last_x, last_y) = *coords.last().unwrap();
+    let last_x = x + last_column;
+    let last_y = (y as f32 + s(17.0) as f32
+        - (curve.last().copied().unwrap_or_default() / peak * s(14.0) as f64) as f32)
+        .round() as i32;
     for py in last_y - s(5.0)..=last_y + s(5.0) {
         for px in last_x - s(5.0)..=last_x + s(5.0) {
             if px < 0 || px >= frame.w || py < 0 || py >= frame.h {
@@ -1109,7 +1254,8 @@ struct Bar {
 
 fn decorate_spark(
     f: &mut Frame,
-    points: &[f32],
+    samples: &[(i64, f64)],
+    end: i64,
     busy: bool,
     down: bool,
     pulse: f32,
@@ -1155,42 +1301,33 @@ fn decorate_spark(
                 0.35,
             );
         }
-        if points.len() < 3 {
+        if samples.len() < 2 {
             f.w = old + add;
             f.px = px;
             return;
         }
-        let peak = points.iter().copied().fold(1.0f32, f32::max);
-        let sample = |position: f32| {
-            let last = points.len().saturating_sub(1);
-            let index = position.floor() as usize;
-            let t = position - index as f32;
-            let p0 = points[index.saturating_sub(1).min(last)];
-            let p1 = points[index.min(last)];
-            let p2 = points[(index + 1).min(last)];
-            let p3 = points[(index + 2).min(last)];
-            let t2 = t * t;
-            let t3 = t2 * t;
-            (0.5 * ((2.0 * p1)
-                + (-p0 + p2) * t
-                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3))
-                .clamp(0.0, peak)
-        };
-        let mut curve = Vec::with_capacity((graph_width + 1) as usize);
-        for dx in 0..=graph_width {
-            let position = if points.len() == 1 {
-                0.0
-            } else {
-                dx as f32 * (points.len() - 1) as f32 / graph_width as f32
-            };
-            let value = sample(position);
-            curve.push(baseline as f32 - value / peak * graph_height as f32);
+        let buckets = bucket_samples(samples, end, 600, 20);
+        if buckets.filled_buckets < 3 {
+            f.w = old + add;
+            f.px = px;
+            return;
         }
+        let map_x = |bucket: usize| {
+            (bucket as f32 * graph_width as f32
+                / buckets.total_buckets.saturating_sub(1).max(1) as f32)
+                .round() as i32
+        };
+        let first_column = map_x(buckets.first_bucket);
+        let last_column = map_x(buckets.first_bucket + buckets.values.len() - 1);
+        let peak = buckets.values.iter().copied().fold(1.0f64, f64::max);
+        let curve = monotone_curve(&buckets.values, (last_column - first_column + 1) as usize)
+            .into_iter()
+            .map(|value| baseline as f32 - (value / peak * graph_height as f64) as f32)
+            .collect::<Vec<_>>();
 
         // Soft area fill, strongest at the curve and fading toward the baseline.
         for (dx, curve_y) in curve.iter().copied().enumerate() {
-            let x = x0 + dx as i32;
+            let x = x0 + first_column + dx as i32;
             let top = curve_y.ceil() as i32;
             let depth = (baseline - top).max(1) as f32;
             for y in top..=baseline {
@@ -1198,7 +1335,7 @@ fn decorate_spark(
                 blend_pixel(
                     &mut px[(y * (old + add) + x) as usize],
                     line_color,
-                    0.025 + 0.15 * fade,
+                    0.02 + 0.36 * fade,
                 );
             }
         }
@@ -1206,7 +1343,7 @@ fn decorate_spark(
         // Smooth 1.5 px stroke at 100% scale.
         let radius = (0.75 * scale).max(0.75);
         for (dx, curve_y) in curve.iter().copied().enumerate() {
-            let x = x0 + dx as i32;
+            let x = x0 + first_column + dx as i32;
             let extent = (radius + 1.0).ceil() as i32;
             for y in curve_y.round() as i32 - extent..=curve_y.round() as i32 + extent {
                 if y >= 0 && y < f.h && x >= 0 && x < old + add {
@@ -1222,7 +1359,7 @@ fn decorate_spark(
         }
 
         // Emphasize the newest sample.
-        let last_x = x0 + graph_width;
+        let last_x = x0 + last_column;
         let last_y = *curve.last().unwrap_or(&(baseline as f32));
         let dot_radius = (1.8 * scale).max(1.5);
         let extent = dot_radius.ceil() as i32;
@@ -2197,6 +2334,45 @@ mod tests {
         assert_eq!(ease_out_cubic(0.0), 0.0);
         assert_eq!(ease_out_cubic(1.0), 1.0);
         assert!(ease_out_cubic(0.5) > 0.5);
+    }
+
+    #[test]
+    fn spark_buckets_average_interpolate_and_trim_empty_edges() {
+        let samples = [(45, 10.0), (50, 20.0), (85, 30.0)];
+        assert_eq!(
+            bucket_samples(&samples, 100, 60, 3),
+            BucketSeries {
+                values: vec![15.0, 22.5, 30.0],
+                first_bucket: 0,
+                total_buckets: 3,
+                filled_buckets: 2,
+            }
+        );
+
+        let samples = [(25, 10.0), (65, 30.0)];
+        assert_eq!(
+            bucket_samples(&samples, 100, 100, 5),
+            BucketSeries {
+                values: vec![10.0, 20.0, 30.0],
+                first_bucket: 1,
+                total_buckets: 5,
+                filled_buckets: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn monotone_curve_stays_nonnegative_and_inside_each_segment() {
+        let values = [0.0, 10.0, 4.0, 12.0, 3.0];
+        let sample_count = 401;
+        let curve = monotone_curve(&values, sample_count);
+        for (sample, value) in curve.into_iter().enumerate() {
+            let position = sample as f64 * (values.len() - 1) as f64 / (sample_count - 1) as f64;
+            let index = position.floor().min((values.len() - 2) as f64) as usize;
+            assert!(value >= 0.0);
+            assert!(value >= values[index].min(values[index + 1]) - 1e-9);
+            assert!(value <= values[index].max(values[index + 1]) + 1e-9);
+        }
     }
 }
 

@@ -85,6 +85,8 @@ pub struct Section {
     pub chip: String,
     pub bars: Vec<Bar>,
     pub chart: Vec<f64>,
+    pub spark_samples: Vec<(i64, f64)>,
+    pub chart_end: i64,
     pub today: String,
     pub as_of: String,
     pub error: Option<String>,
@@ -558,6 +560,13 @@ fn render_with_hover(
             hovered,
         )
     };
+    for y in 0..height {
+        for x in 0..width {
+            if rounded(x, y, width, height, radius) {
+                pixels[(y * width + x) as usize] |= 255u32 << 24;
+            }
+        }
+    }
     (width, height, pixels)
 }
 
@@ -614,7 +623,7 @@ fn card_palette(dark: bool) -> CardPalette {
         codex: rgba_color(p.codex),
         spark: rgba_color(p.spark),
         stale_fill: if dark {
-            rgb(44, 44, 49)
+            rgb(34, 34, 39)
         } else {
             rgb(230, 230, 234)
         },
@@ -1342,6 +1351,7 @@ unsafe fn draw_e2_panel(
             false,
             true,
             1.0,
+            None,
             scale,
         );
     }
@@ -1583,23 +1593,38 @@ unsafe fn draw_e2_spark(
         DT_LEFT,
     );
     let chart_left = (left + hero_width + s(4.0)).min(right - s(50.0));
-    draw_e2_chart(
-        dc,
-        &section.chart,
-        RECT {
-            left: chart_left,
-            top,
-            right,
-            bottom: top + s(38.0),
-        },
-        if down { palette.faint } else { palette.spark },
-        palette.separator,
-        background,
-        true,
-        !down,
-        pulse_alpha,
-        scale,
-    );
+    let buckets = crate::render::bucket_samples(&section.spark_samples, section.chart_end, 600, 30);
+    let chart_rect = RECT {
+        left: chart_left,
+        top,
+        right,
+        bottom: top + s(38.0),
+    };
+    if buckets.filled_buckets < 3 {
+        draw_line(
+            dc,
+            chart_rect.left,
+            chart_rect.bottom - 1,
+            chart_rect.right,
+            chart_rect.bottom - 1,
+            palette.separator,
+            s(1.0),
+        );
+    } else {
+        draw_e2_chart(
+            dc,
+            &buckets.values,
+            chart_rect,
+            if down { palette.faint } else { palette.spark },
+            palette.separator,
+            background,
+            true,
+            !down,
+            pulse_alpha,
+            Some((buckets.first_bucket, buckets.total_buckets)),
+            scale,
+        );
+    }
     let stats_top = top + s(50.0);
     draw_line(
         dc,
@@ -1746,6 +1771,7 @@ unsafe fn draw_e2_chart(
     spark_chart: bool,
     show_dot: bool,
     pulse_alpha: f32,
+    bucket_range: Option<(usize, usize)>,
     scale: f32,
 ) {
     let width = rect.right - rect.left;
@@ -1785,19 +1811,40 @@ unsafe fn draw_e2_chart(
     } else {
         100.0
     };
-    let points = values
+    let (plot_left, plot_right) = if let Some((first_bucket, total_buckets)) = bucket_range {
+        let map_x = |bucket: usize| {
+            rect.left
+                + (bucket as f32 * (width - 1) as f32
+                    / total_buckets.saturating_sub(1).max(1) as f32)
+                    .round() as i32
+        };
+        (
+            map_x(first_bucket),
+            map_x(first_bucket + values.len().saturating_sub(1)),
+        )
+    } else {
+        (rect.left, rect.right - 1)
+    };
+    let plot_width = (plot_right - plot_left + 1).max(2);
+    let plotted = if spark_chart {
+        crate::render::monotone_curve(values, plot_width as usize)
+    } else {
+        values.to_vec()
+    };
+    let points = plotted
         .iter()
         .enumerate()
         .map(|(index, value)| POINT {
-            x: rect.left
-                + (index as f32 * (width - 1) as f32 / (values.len() - 1) as f32).round() as i32,
+            x: plot_left
+                + (index as f32 * (plot_width - 1) as f32 / (plotted.len() - 1) as f32).round()
+                    as i32,
             y: rect.bottom - 1 - (value.clamp(0.0, max) / max * (height - 2) as f64).round() as i32,
         })
         .collect::<Vec<_>>();
     if !spark_chart || show_dot {
-        for x in rect.left..rect.right {
+        for x in plot_left..=plot_right {
             let position =
-                (x - rect.left) as f32 * (points.len() - 1) as f32 / (width - 1).max(1) as f32;
+                (x - plot_left) as f32 * (points.len() - 1) as f32 / (plot_width - 1).max(1) as f32;
             let index = position.floor() as usize;
             let t = position - index as f32;
             let a = points[index.min(points.len() - 1)];
@@ -1809,7 +1856,15 @@ unsafe fn draw_e2_chart(
                     dc,
                     x,
                     py,
-                    blend_color(background, accent, 0.30 * (1.0 - depth) + 0.02 * depth),
+                    blend_color(
+                        background,
+                        accent,
+                        if spark_chart {
+                            0.38 * (1.0 - depth) + 0.02 * depth
+                        } else {
+                            0.30 * (1.0 - depth) + 0.02 * depth
+                        },
+                    ),
                 );
             }
         }
@@ -2878,5 +2933,31 @@ mod tests {
         assert_eq!(age_copy(21600, true), "6 h old");
         assert_eq!(reset_time_copy(true, "Thu", "10:19 PM"), "10:19 PM");
         assert_eq!(reset_time_copy(false, "Thu", "8:59 AM"), "Thu 8:59 AM");
+    }
+
+    #[test]
+    fn every_pixel_inside_card_is_opaque() {
+        let snapshot = Snapshot {
+            updated: "4 s ago".into(),
+            sections: vec![Section {
+                provider: ProviderKind::Claude,
+                title: "Claude".into(),
+                bars: vec![Bar {
+                    label: "5-hour".into(),
+                    percent: 11.0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (width, height, pixels) = render(&snapshot, true, 96, false);
+        for y in 0..height {
+            for x in 0..width {
+                if rounded(x, y, width, height, 10) {
+                    assert_eq!(pixels[(y * width + x) as usize] >> 24, 255);
+                }
+            }
+        }
     }
 }

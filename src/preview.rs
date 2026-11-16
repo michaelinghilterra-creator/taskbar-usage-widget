@@ -17,7 +17,12 @@ pub fn run(output: &Path) -> Result<Vec<PathBuf>, String> {
         .unwrap_or_else(|| fake_state(now));
     let mut spark_points = history_points(now, 1200);
     if spark_points.len() < 3 && state["_preview_fake"].as_bool() == Some(true) {
-        spark_points = vec![12.0, 48.0, 31.0, 84.0, 66.0, 102.0, 84.0];
+        spark_points = (0..=120)
+            .map(|index| {
+                let t = index as f32;
+                76.0 + 0.08 * t + 9.0 * (t / 15.0).sin() + 3.5 * (t / 5.5).sin()
+            })
+            .collect();
     }
     let mut written = Vec::new();
 
@@ -43,6 +48,12 @@ pub fn run(output: &Path) -> Result<Vec<PathBuf>, String> {
             let path = output.join(format!("flyout-{theme}-150{suffix}.bmp"));
             write_bmp_u32(&path, width, height, &pixels).map_err(|error| error.to_string())?;
             written.push(path);
+            if dark && !pinned {
+                let pixels = composite_argb(&pixels, 0xffc8c8cc);
+                let path = output.join("flyout-dark-150-over-light.bmp");
+                write_bmp_u32(&path, width, height, &pixels).map_err(|error| error.to_string())?;
+                written.push(path);
+            }
         }
         let wide_width = (560.0_f32 * 1.5).round() as i32;
         let (width, height, pixels) =
@@ -286,7 +297,8 @@ fn taskbar_model(state: &Value, dark: bool, now: i64, spark_points: &[f32]) -> r
         show_claude: true,
         show_codex: true,
         show_spark: spark.is_some(),
-        spark_points: spark_points.to_vec(),
+        spark_samples: preview_spark_samples(now, spark_points),
+        spark_now: now,
         spark_busy: spark.is_some_and(spark_is_busy),
         spark_down: spark.is_some_and(|value| {
             value["error"].is_string() || !value["up"].as_bool().unwrap_or(false)
@@ -500,7 +512,8 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
                 })
                 .collect(),
         });
-        section.chart = spark_points.iter().map(|value| *value as f64).collect();
+        section.spark_samples = preview_spark_samples(now, spark_points);
+        section.chart_end = now;
         section.error = spark["error"].as_str().map(str::to_owned);
         section.stale = now - spark["fetched_at"].as_i64().unwrap_or(now) > 30;
         sections.push(section);
@@ -566,6 +579,15 @@ fn history_points(now: i64, seconds: i64) -> Vec<f32> {
     history_values("spark", "", now - seconds)
         .into_iter()
         .map(|value| value as f32)
+        .collect()
+}
+
+fn preview_spark_samples(now: i64, points: &[f32]) -> Vec<(i64, f64)> {
+    let first = now - points.len().saturating_sub(1) as i64 * 5;
+    points
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (first + index as i64 * 5, *value as f64))
         .collect()
 }
 
@@ -637,6 +659,20 @@ fn composite_taskbar(frame: &render::Frame, background: [u8; 3], height: i32) ->
         }
     }
     output
+}
+
+fn composite_argb(pixels: &[u32], background: u32) -> Vec<u32> {
+    pixels
+        .iter()
+        .map(|pixel| {
+            let alpha = pixel >> 24;
+            let keep = 255 - alpha;
+            let channel = |shift: u32| {
+                (((pixel >> shift) & 255) + ((background >> shift) & 255) * keep / 255).min(255)
+            };
+            0xff000000 | (channel(16) << 16) | (channel(8) << 8) | channel(0)
+        })
+        .collect()
 }
 
 fn write_bmp(path: &Path, width: i32, height: i32, pixels: &[[u8; 4]]) -> io::Result<()> {
