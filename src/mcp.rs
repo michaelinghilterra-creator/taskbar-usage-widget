@@ -2,10 +2,8 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::System::Registry::{
-    RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ,
-};
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
 const PROTOCOL: &str = "2025-06-18";
@@ -151,7 +149,9 @@ fn usage_headroom(time: i64) -> Value {
             // Never expose email addresses or folder paths through MCP.
             reading["account"] = json!(format!("account {claude_number}"));
         } else {
-            reading.as_object_mut().map(|object| object.remove("account"));
+            reading
+                .as_object_mut()
+                .map(|object| object.remove("account"));
         }
         let stale = time - reading["as_of"].as_i64().unwrap_or(0);
         let mut windows = Vec::new();
@@ -159,9 +159,7 @@ fn usage_headroom(time: i64) -> Value {
             for window in source {
                 let normalized = normalize_window(window, time, stale);
                 let used = normalized["used_pct"].as_f64().unwrap_or(0.0);
-                let projected = normalized["projected_at_reset_pct"]
-                    .as_f64()
-                    .unwrap_or(0.0);
+                let projected = normalized["projected_at_reset_pct"].as_f64().unwrap_or(0.0);
                 let full = normalized["full_at"].is_string();
                 if provider == "claude" && (used >= 90.0 || projected >= 100.0 || full) {
                     claude_tight = true;
@@ -182,7 +180,10 @@ fn usage_headroom(time: i64) -> Value {
     let spark = spark.filter(|value| !value.is_null()).map(|value| {
         let compact = compact_spark(&value, time);
         summary.push(if compact["up"].as_bool().unwrap_or(false) {
-            format!("Spark up, {} running", compact["running"].as_i64().unwrap_or(0))
+            format!(
+                "Spark up, {} running",
+                compact["running"].as_i64().unwrap_or(0)
+            )
         } else {
             "Spark down".into()
         });
@@ -335,7 +336,10 @@ fn spark_host() -> Option<String> {
         {
             return None;
         }
-        let end = value.iter().position(|character| *character == 0).unwrap_or(value.len());
+        let end = value
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(value.len());
         let host = String::from_utf16_lossy(&value[..end]);
         (!host.is_empty()).then_some(host)
     }
@@ -354,8 +358,7 @@ fn iso_local(unix: i64) -> String {
         SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local);
         format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-            local.wYear, local.wMonth, local.wDay,
-            local.wHour, local.wMinute, local.wSecond
+            local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond
         )
     }
 }
@@ -391,14 +394,22 @@ mod tests {
 "#,
         );
         assert_eq!(result[0]["result"]["protocolVersion"], "2025-03-26");
-        assert_eq!(result[0]["result"]["serverInfo"]["name"], "taskbar-usage-widget");
+        assert_eq!(
+            result[0]["result"]["serverInfo"]["name"],
+            "taskbar-usage-widget"
+        );
     }
 
     #[test]
     fn tools_list_round_trip() {
-        let result = exchange(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}
-"#);
-        assert_eq!(result[0]["result"]["tools"][0]["name"], "get_usage_headroom");
+        let result = exchange(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+"#,
+        );
+        assert_eq!(
+            result[0]["result"]["tools"][0]["name"],
+            "get_usage_headroom"
+        );
     }
 
     #[test]
@@ -431,13 +442,29 @@ mod tests {
         let compact = compact_spark(&source, 1000);
         let object = compact.as_object().unwrap();
         let expected = [
-            "up", "model", "engine", "tok_s", "peak_20m", "running", "waiting",
-            "kv_pct", "ttft_ms", "gpu_util", "gpu_temp", "gpu_power", "mem_pct",
-            "busy", "aux", "stale_secs",
+            "up",
+            "model",
+            "engine",
+            "tok_s",
+            "peak_20m",
+            "running",
+            "waiting",
+            "kv_pct",
+            "ttft_ms",
+            "gpu_util",
+            "gpu_temp",
+            "gpu_power",
+            "mem_pct",
+            "busy",
+            "aux",
+            "stale_secs",
         ];
         assert_eq!(object.len(), expected.len());
         assert!(expected.iter().all(|key| object.contains_key(*key)));
         assert!(object.get("endpoints").is_none());
-        assert_eq!(compact["aux"][0], json!({"name":"TTS","up":true,"busy":false}));
+        assert_eq!(
+            compact["aux"][0],
+            json!({"name":"TTS","up":true,"busy":false})
+        );
     }
 }

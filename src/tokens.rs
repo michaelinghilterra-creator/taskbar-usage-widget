@@ -54,7 +54,9 @@ impl Tracker {
 
     fn read_claude(&mut self, path: &Path, day: (u16, u16, u16)) {
         self.read_lines(path, |tracker, value| {
-            let Some(timestamp) = value["timestamp"].as_str().and_then(crate::api::parse_iso8601)
+            let Some(timestamp) = value["timestamp"]
+                .as_str()
+                .and_then(crate::api::parse_iso8601)
             else {
                 return;
             };
@@ -82,11 +84,15 @@ impl Tracker {
 
     fn read_codex(&mut self, path: &Path, day: (u16, u16, u16)) {
         self.read_lines(path, |tracker, value| {
-            let Some(timestamp) = value["timestamp"].as_str().and_then(crate::api::parse_iso8601)
+            let Some(timestamp) = value["timestamp"]
+                .as_str()
+                .and_then(crate::api::parse_iso8601)
             else {
                 return;
             };
-            if local_day(timestamp) != day || value["payload"]["type"].as_str() != Some("token_count") {
+            if local_day(timestamp) != day
+                || value["payload"]["type"].as_str() != Some("token_count")
+            {
                 return;
             }
             let total = value["payload"]["info"]["last_token_usage"]["total_tokens"]
@@ -145,7 +151,9 @@ fn visit_jsonl(dir: &Path, files: &mut Vec<PathBuf>, cap: usize) {
                 .metadata()
                 .and_then(|meta| meta.modified())
                 .ok()
-                .is_some_and(|modified| local_day(system_time(modified)) == local_day(system_time(SystemTime::now())))
+                .is_some_and(|modified| {
+                    local_day(system_time(modified)) == local_day(system_time(SystemTime::now()))
+                })
         {
             files.push(path);
         }
@@ -153,7 +161,9 @@ fn visit_jsonl(dir: &Path, files: &mut Vec<PathBuf>, cap: usize) {
 }
 
 fn system_time(time: SystemTime) -> i64 {
-    time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn local_day(unix: i64) -> (u16, u16, u16) {

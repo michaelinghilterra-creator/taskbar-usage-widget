@@ -45,8 +45,20 @@ pub fn request(
     request_to(method, host, 443, path, headers, body, true, 15_000)
 }
 
-pub fn request_to(method: &str, host_port: &str, default_port: u16, path: &str, headers: &str, body: Option<&[u8]>, secure: bool, timeout_ms: i32) -> Result<Response, String> {
-    let (host, port) = host_port.rsplit_once(':').and_then(|(h,p)| p.parse::<u16>().ok().map(|p|(h,p))).unwrap_or((host_port,default_port));
+pub fn request_to(
+    method: &str,
+    host_port: &str,
+    default_port: u16,
+    path: &str,
+    headers: &str,
+    body: Option<&[u8]>,
+    secure: bool,
+    timeout_ms: i32,
+) -> Result<Response, String> {
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .and_then(|(h, p)| p.parse::<u16>().ok().map(|p| (h, p)))
+        .unwrap_or((host_port, default_port));
     unsafe {
         let session = check(
             WinHttpOpen(
@@ -108,7 +120,13 @@ pub fn request_to(method: &str, host_port: &str, default_port: u16, path: &str, 
             let start = out.len();
             out.resize(start + avail as usize, 0);
             let mut read = 0u32;
-            if WinHttpReadData(req.0, out[start..].as_mut_ptr() as *mut c_void, avail, &mut read) == 0 {
+            if WinHttpReadData(
+                req.0,
+                out[start..].as_mut_ptr() as *mut c_void,
+                avail,
+                &mut read,
+            ) == 0
+            {
                 return Err(format!("read error ({})", last_error()));
             }
             out.truncate(start + read as usize);

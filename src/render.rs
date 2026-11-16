@@ -147,9 +147,17 @@ pub struct Frame {
 fn value_text(v: Option<f64>, show_left: bool, hide_percent: bool) -> String {
     match v {
         Some(p) => {
-            let used = if hide_percent && !show_left { p.round().max(0.0) as i64 } else { p.round().clamp(0.0, 100.0) as i64 };
+            let used = if hide_percent && !show_left {
+                p.round().max(0.0) as i64
+            } else {
+                p.round().clamp(0.0, 100.0) as i64
+            };
             let n = if show_left { 100 - used } else { used };
-            if hide_percent { n.to_string() } else { format!("{n}%") }
+            if hide_percent {
+                n.to_string()
+            } else {
+                format!("{n}%")
+            }
         }
         None => "–".into(),
     }
@@ -167,9 +175,19 @@ fn value_color(v: Option<f64>, pal: &Palette) -> Rgba {
 unsafe fn make_font(px: i32, faces: &[&str]) -> HFONT {
     for (i, face) in faces.iter().enumerate() {
         let f = CreateFontW(
-            -px, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0,
-            DEFAULT_CHARSET as u32, OUT_TT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32,
-            DEFAULT_QUALITY as u32, (DEFAULT_PITCH | FF_SWISS) as u32,
+            -px,
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_TT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            DEFAULT_QUALITY as u32,
+            (DEFAULT_PITCH | FF_SWISS) as u32,
             wide(face).as_ptr(),
         );
         if i + 1 == faces.len() || font_is(f, face) {
@@ -227,7 +245,11 @@ fn displayed_value_color(
     palette: &Palette,
 ) -> Rgba {
     if provider_mark == 2 {
-        return if critical { palette.crit } else { palette.value };
+        return if critical {
+            palette.crit
+        } else {
+            palette.value
+        };
     }
     match (value, pace, projected) {
         _ if critical => palette.crit,
@@ -337,11 +359,7 @@ fn decorate_spark(
         }
     }
     let alpha = if busy { pulse.clamp(0.45, 1.0) } else { 1.0 };
-    let color = if down {
-        [28, 43, 196]
-    } else {
-        [0, 185, 118]
-    };
+    let color = if down { [28, 43, 196] } else { [0, 185, 118] };
     let dot = [
         (color[0] as f32 * alpha) as u8,
         (color[1] as f32 * alpha) as u8,
@@ -387,11 +405,10 @@ fn decorate_spark(
             let p3 = points[(index + 2).min(last)];
             let t2 = t * t;
             let t3 = t2 * t;
-            (0.5
-                * ((2.0 * p1)
-                    + (-p0 + p2) * t
-                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3))
+            (0.5 * ((2.0 * p1)
+                + (-p0 + p2) * t
+                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3))
                 .clamp(0.0, peak)
         };
         let mut curve = Vec::with_capacity((graph_width + 1) as usize);
@@ -427,8 +444,8 @@ fn decorate_spark(
             let extent = (radius + 1.0).ceil() as i32;
             for y in curve_y.round() as i32 - extent..=curve_y.round() as i32 + extent {
                 if y >= 0 && y < f.h && x >= 0 && x < old + add {
-                    let coverage = (radius + 0.5 - (y as f32 + 0.5 - curve_y).abs())
-                        .clamp(0.0, 1.0);
+                    let coverage =
+                        (radius + 0.5 - (y as f32 + 0.5 - curve_y).abs()).clamp(0.0, 1.0);
                     blend_pixel(
                         &mut px[(y * (old + add) + x) as usize],
                         line_color,
@@ -448,8 +465,7 @@ fn decorate_spark(
                 if y >= 0 && y < f.h && x >= 0 && x < old + add {
                     let dx = x as f32 + 0.5 - last_x as f32;
                     let dy = y as f32 + 0.5 - last_y;
-                    let coverage = (dot_radius + 0.5 - (dx * dx + dy * dy).sqrt())
-                        .clamp(0.0, 1.0);
+                    let coverage = (dot_radius + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
                     blend_pixel(
                         &mut px[(y * (old + add) + x) as usize],
                         line_color,
@@ -485,12 +501,10 @@ fn combine(frames: Vec<(Group, Frame)>, vertical: bool, dark: bool, scale: f32) 
     let w = if vertical {
         frames.iter().map(|(_, frame)| frame.w).max().unwrap_or(1)
     } else {
-        frames.iter().map(|(_, frame)| frame.w).sum::<i32>()
-            + gap * (frames.len() as i32 - 1)
+        frames.iter().map(|(_, frame)| frame.w).sum::<i32>() + gap * (frames.len() as i32 - 1)
     };
     let h = if vertical {
-        frames.iter().map(|(_, frame)| frame.h).sum::<i32>()
-            + gap * (frames.len() as i32 - 1)
+        frames.iter().map(|(_, frame)| frame.h).sum::<i32>() + gap * (frames.len() as i32 - 1)
     } else {
         frames.iter().map(|(_, frame)| frame.h).max().unwrap_or(1)
     };
@@ -531,7 +545,9 @@ fn combine(frames: Vec<(Group, Frame)>, vertical: bool, dark: bool, scale: f32) 
 }
 
 fn render_one(m: &Model, h: i32, scale: f32, vert: Option<i32>) -> Frame {
-    let Some(avail) = vert else { return layout(m, h, scale, false) };
+    let Some(avail) = vert else {
+        return layout(m, h, scale, false);
+    };
     let mut k = 1.0;
     loop {
         let f = layout(m, 0, scale * k, true);
@@ -561,8 +577,16 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
     }];
     let rows: &[Row] = if m.rows.is_empty() { &empty } else { &m.rows };
     // Vertical: every account in one column, one line per limit.
-    let rows_per_col = if vertical { rows.len() } else { m.rows_per_col.clamp(1, MAX_ROWS_PER_COLUMN) };
-    let per_col = if vertical { 1 } else { rows.len().min(rows_per_col) };
+    let rows_per_col = if vertical {
+        rows.len()
+    } else {
+        m.rows_per_col.clamp(1, MAX_ROWS_PER_COLUMN)
+    };
+    let per_col = if vertical {
+        1
+    } else {
+        rows.len().min(rows_per_col)
+    };
     // One account uses the full height like before; stacked accounts share
     // it, with a small margin, and the text shrinks to fit.
     let (band_top, row_h) = if per_col == 1 {
@@ -589,8 +613,16 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         // Ring diameter: big enough for the number inside, or about text height beside it.
         // "Space around the rings": 14 % of the row free above and below instead of
         // reaching the taskbar's edges (vertical lines have their own spacing).
-        let fill = if inside && m.ring_space && !vertical { (row_h * 0.72).round() as i32 } else { row_h as i32 - s(2.0) };
-        let ring_d = if !m.rings { 0 } else { fill.clamp(1, s(if inside { 34.0 } else { 16.0 })) };
+        let fill = if inside && m.ring_space && !vertical {
+            (row_h * 0.72).round() as i32
+        } else {
+            row_h as i32 - s(2.0)
+        };
+        let ring_d = if !m.rings {
+            0
+        } else {
+            fill.clamp(1, s(if inside { 34.0 } else { 16.0 }))
+        };
         let ring_gap = if m.rings && !inside { s(5.0) } else { 0 };
         let mut small_px = ((ring_d as f32 * 0.32).round() as i32).max(1);
         let mut f_small = make_font(
@@ -598,7 +630,10 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
             &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"],
         );
         let f_label = make_font(font_px, &["Segoe UI Variable Text", "Segoe UI"]);
-        let f_value = make_font(font_px, &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"]);
+        let f_value = make_font(
+            font_px,
+            &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"],
+        );
 
         let dc = CreateCompatibleDC(std::ptr::null_mut());
         let measure = |t: &[u16], f: HFONT| -> i32 {
@@ -623,25 +658,50 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         if inside {
             // The widest number, "100%" (or "100"), fills the ring's inner width minus
             // the margin, growing or shrinking the text as needed.
-            let room = (ring_d as f32 - 2.0 * (ring_d as f32 * 0.1).max(1.5) - 2.0 * s(m.ring_margin as f32) as f32).max(1.0);
-            let widest = measure(&(if m.hide_percent { "100" } else { "100%" }).encode_utf16().collect::<Vec<u16>>(), f_small) as f32;
+            let room = (ring_d as f32
+                - 2.0 * (ring_d as f32 * 0.1).max(1.5)
+                - 2.0 * s(m.ring_margin as f32) as f32)
+                .max(1.0);
+            let widest = measure(
+                &(if m.hide_percent { "100" } else { "100%" })
+                    .encode_utf16()
+                    .collect::<Vec<u16>>(),
+                f_small,
+            ) as f32;
             if widest > 0.0 && (widest - room).abs() >= 0.5 {
                 small_px = ((small_px as f32 * room / widest).floor() as i32).max(1);
                 DeleteObject(f_small);
-                f_small = make_font(small_px, &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"]);
+                f_small = make_font(
+                    small_px,
+                    &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"],
+                );
             }
         }
 
-        let dim = |stale: bool, c: Rgba| if stale { Rgba(c.0, c.1, c.2, c.3 * 0.5) } else { c };
+        let dim = |stale: bool, c: Rgba| {
+            if stale {
+                Rgba(c.0, c.1, c.2, c.3 * 0.5)
+            } else {
+                c
+            }
+        };
         let all_stale = rows.iter().all(|r| r.stale);
         let pad_l = s(8.0);
-        let icon = if m.hide_icon { 0 } else { s(m.icon_size as f32).min(h) };
+        let icon = if m.hide_icon {
+            0
+        } else {
+            s(m.icon_size as f32).min(h)
+        };
         let gap_icon = if m.hide_icon { 0 } else { s(7.0) };
         let gap_lv = if m.hide_labels { 0 } else { s(5.0) };
         let gap_div = s(10.0);
         let div_w = s(1.0).max(1);
         let pad_r = s(4.0);
-        let div_h = if per_col == 1 { s(20.0) } else { (row_h as i32 - s(2.0)).max(1) };
+        let div_h = if per_col == 1 {
+            s(20.0)
+        } else {
+            (row_h as i32 - s(2.0)).max(1)
+        };
 
         let mut x = pad_l;
         let mut icon_x = x;
@@ -663,16 +723,26 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
             // Line the column's rows up: each field is as wide as its widest value.
             let labels = [enc("5h"), enc("W"), enc("F")];
             // Which of 5h / week / Fable are shown, as indexes into `labels`.
-            let ids: Vec<usize> = [!m.hide_five, !m.hide_week, !m.hide_fable && rows.iter().any(|r| r.fable.is_some())]
-                .iter()
-                .enumerate()
-                .filter_map(|(k, on)| on.then_some(k))
-                .collect();
+            let ids: Vec<usize> = [
+                !m.hide_five,
+                !m.hide_week,
+                !m.hide_fable && rows.iter().any(|r| r.fable.is_some()),
+            ]
+            .iter()
+            .enumerate()
+            .filter_map(|(k, on)| on.then_some(k))
+            .collect();
             let groups = ids.len();
             let mut label_w: Vec<i32> = ids
                 .iter()
                 .map(|&k| &labels[k])
-                .map(|l| if m.hide_labels { 0 } else { measure(l, f_label) })
+                .map(|l| {
+                    if m.hide_labels {
+                        0
+                    } else {
+                        measure(l, f_label)
+                    }
+                })
                 .collect();
             let values: Vec<Vec<Vec<u16>>> = col
                 .iter()
@@ -696,7 +766,8 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
             let mut value_w = vec![0; groups];
             for v in &values {
                 for g in 0..groups {
-                    value_w[g] = value_w[g].max(measure(&v[g], if inside { f_small } else { f_value }));
+                    value_w[g] =
+                        value_w[g].max(measure(&v[g], if inside { f_small } else { f_value }));
                 }
             }
             if !m.rings && m.provider_mark != 2 {
@@ -711,11 +782,25 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                 let lw = label_w.iter().copied().max().unwrap_or(0);
                 label_w.iter_mut().for_each(|l| *l = lw);
                 let vw = value_w.iter().copied().max().unwrap_or(0);
-                x = pad_l + lw + gap_lv + if inside { ring_d } else { ring_d + ring_gap + vw };
+                x = pad_l
+                    + lw
+                    + gap_lv
+                    + if inside {
+                        ring_d
+                    } else {
+                        ring_d + ring_gap + vw
+                    };
             } else {
                 for g in 0..groups {
                     group_x[g] = x;
-                    x += label_w[g] + gap_lv + if inside { ring_d } else { ring_d + ring_gap + value_w[g] } + gap_div;
+                    x += label_w[g]
+                        + gap_lv
+                        + if inside {
+                            ring_d
+                        } else {
+                            ring_d + ring_gap + value_w[g]
+                        }
+                        + gap_div;
                     div_x[g] = x;
                     x += div_w;
                     if g + 1 < groups {
@@ -743,11 +828,27 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                     };
                     let val = [row.five, row.week, row.fable][ids[g]];
                     if !m.hide_labels {
-                        segs.push(Seg { text: labels[ids[g]].clone(), bold: false, small: false, x: group_x[g], w: label_w[g], y0, y1, color: pal.label, blur: 0, slack: s(2.0) });
+                        segs.push(Seg {
+                            text: labels[ids[g]].clone(),
+                            bold: false,
+                            small: false,
+                            x: group_x[g],
+                            w: label_w[g],
+                            y0,
+                            y1,
+                            color: pal.label,
+                            blur: 0,
+                            slack: s(2.0),
+                        });
                     }
                     let dy = y0 + ((y1 - y0) - div_h) / 2;
                     if !vertical && g + 1 < groups {
-                        dividers.push(Divider { x0: div_x[g], x1: div_x[g] + div_w, y0: dy.max(0), y1: (dy + div_h).min(h) });
+                        dividers.push(Divider {
+                            x0: div_x[g],
+                            x1: div_x[g] + div_w,
+                            y0: dy.max(0),
+                            y1: (dy + div_h).min(h),
+                        });
                     }
                     let content_x = group_x[g] + label_w[g] + gap_lv;
                     let pi = ids[g];
@@ -762,15 +863,25 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                     if m.rings {
                         // The ring shows the same quantity as the number.
                         let frac = |v: Option<f64>| {
-                            let used = v.map_or(0.0, |q| q.round().clamp(0.0, 100.0) as f32 / 100.0);
-                            if v.is_some() && m.show_left { 1.0 - used } else { used }
+                            let used =
+                                v.map_or(0.0, |q| q.round().clamp(0.0, 100.0) as f32 / 100.0);
+                            if v.is_some() && m.show_left {
+                                1.0 - used
+                            } else {
+                                used
+                            }
                         };
                         let to = frac(val);
                         rings.push(Ring {
                             x: content_x,
                             y: y0 + ((y1 - y0) - ring_d) / 2,
-                            frac: row.roll.map_or(to, |(from, _)| frac(from[ids[g]]) + (to - frac(from[ids[g]])) * p),
-                            color: dim(row.stale, if color == pal.value { RING_BLUE } else { color }),
+                            frac: row.roll.map_or(to, |(from, _)| {
+                                frac(from[ids[g]]) + (to - frac(from[ids[g]])) * p
+                            }),
+                            color: dim(
+                                row.stale,
+                                if color == pal.value { RING_BLUE } else { color },
+                            ),
                             pace: row.pace[ids[g]],
                         });
                     }
@@ -797,19 +908,40 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                             ),
                         });
                     }
-                    let color = dim(row.stale, if m.rings && m.ring_color_only { pal.value } else { color });
+                    let color = dim(
+                        row.stale,
+                        if m.rings && m.ring_color_only {
+                            pal.value
+                        } else {
+                            color
+                        },
+                    );
                     let old = row
                         .roll
-                        .map(|(from, _)| enc(&value_text(from[ids[g]], m.show_left, m.hide_percent)))
+                        .map(|(from, _)| {
+                            enc(&value_text(from[ids[g]], m.show_left, m.hide_percent))
+                        })
                         .filter(|o| *o != vals[g]);
                     let Some(old) = old else {
                         let vw = measure(&vals[g], vf);
-                        segs.push(Seg { text: vals[g].clone(), bold: true, small: inside, x: text_x(&vals[g]), w: vw, y0, y1, color, blur: 0, slack: s(2.0) });
+                        segs.push(Seg {
+                            text: vals[g].clone(),
+                            bold: true,
+                            small: inside,
+                            x: text_x(&vals[g]),
+                            w: vw,
+                            y0,
+                            y1,
+                            color,
+                            blur: 0,
+                            slack: s(2.0),
+                        });
                         continue;
                     };
                     // Rolling: each changed character's old glyph leaves upward while the new
                     // one arrives from below, one line apart, each drawn in its own line box.
-                    let mut line = ((if inside { small_px } else { font_px }) as f32 * 1.25).round() as i32;
+                    let mut line =
+                        ((if inside { small_px } else { font_px }) as f32 * 1.25).round() as i32;
                     line += (line - (y1 - y0)) & 1; // same parity as the row, so still glyphs don't shift
                     let top = y0 + ((y1 - y0) - line) / 2;
                     let moved = (p * line as f32).round() as i32;
@@ -857,7 +989,12 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
             h = y + pad_v;
             icon_x = (w - icon) / 2;
             for &hy in &hlines {
-                dividers.push(Divider { x0: pad_l, x1: w - pad_l, y0: hy, y1: hy + div_w });
+                dividers.push(Divider {
+                    x0: pad_l,
+                    x1: w - pad_l,
+                    y0: hy,
+                    y1: hy + div_w,
+                });
             }
         }
 
@@ -880,10 +1017,29 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(dc, 0x00FFFFFF);
         for seg in &segs {
-            SelectObject(dc, if seg.small { f_small } else if seg.bold { f_value } else { f_label });
-            let mut rc = RECT { left: seg.x, top: seg.y0, right: seg.x + seg.w + seg.slack, bottom: seg.y1 };
-            DrawTextW(dc, seg.text.as_ptr(), seg.text.len() as i32, &mut rc,
-                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+            SelectObject(
+                dc,
+                if seg.small {
+                    f_small
+                } else if seg.bold {
+                    f_value
+                } else {
+                    f_label
+                },
+            );
+            let mut rc = RECT {
+                left: seg.x,
+                top: seg.y0,
+                right: seg.x + seg.w + seg.slack,
+                bottom: seg.y1,
+            };
+            DrawTextW(
+                dc,
+                seg.text.as_ptr(),
+                seg.text.len() as i32,
+                &mut rc,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
+            );
         }
         GdiFlush();
         let n = (w * h) as usize;
@@ -930,7 +1086,15 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
             let r = s(4.0) as f32;
             for y in 0..h {
                 for xx in 0..w {
-                    let cov = rounded_rect_cov(xx as f32 + 0.5, y as f32 + 0.5, 0.0, top, w as f32, bottom, r);
+                    let cov = rounded_rect_cov(
+                        xx as f32 + 0.5,
+                        y as f32 + 0.5,
+                        0.0,
+                        top,
+                        w as f32,
+                        bottom,
+                        r,
+                    );
                     over(&mut buf, (y * w + xx) as usize, pal.hover, cov);
                 }
             }
@@ -985,7 +1149,8 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                 for xx in 0..ring_d {
                     let (dx, dy) = (xx as f32 + 0.5 - rad, y as f32 + 0.5 - rad);
                     let d = (dx * dx + dy * dy).sqrt();
-                    let band = (stroke / 2.0 + 0.5 - (d - (rad - stroke / 2.0)).abs()).clamp(0.0, 1.0);
+                    let band =
+                        (stroke / 2.0 + 0.5 - (d - (rad - stroke / 2.0)).abs()).clamp(0.0, 1.0);
                     let i = (r.y + y) * w + r.x + xx;
                     if band <= 0.0 || r.y + y < 0 || r.y + y >= h || i as usize >= n {
                         continue;
@@ -1003,13 +1168,29 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                     over(&mut buf, i as usize, r.color, band * arc);
                 }
             }
-            if let Some(p)=r.pace { let a=p.clamp(0.0,1.0)*std::f32::consts::TAU; let (sn,cs)=a.sin_cos(); for q in 0..stroke.ceil() as i32+2 { let rr=rad-q as f32; let xx=(r.x as f32+rad+sn*rr).round()as i32; let yy=(r.y as f32+rad-cs*rr).round()as i32; if xx>=0&&xx<w&&yy>=0&&yy<h{over(&mut buf,(yy*w+xx)as usize,pal.label,1.0);} } }
+            if let Some(p) = r.pace {
+                let a = p.clamp(0.0, 1.0) * std::f32::consts::TAU;
+                let (sn, cs) = a.sin_cos();
+                for q in 0..stroke.ceil() as i32 + 2 {
+                    let rr = rad - q as f32;
+                    let xx = (r.x as f32 + rad + sn * rr).round() as i32;
+                    let yy = (r.y as f32 + rad - cs * rr).round() as i32;
+                    if xx >= 0 && xx < w && yy >= 0 && yy < h {
+                        over(&mut buf, (yy * w + xx) as usize, pal.label, 1.0);
+                    }
+                }
+            }
         }
 
         // Provider mark.
         let iy = if vertical { pad_v } else { (h - icon) / 2 };
-        let mark = match m.provider_mark { 1=>draw_codex_mark(icon),2=>draw_spark_mark(icon),_ if m.pixel_icon=>draw_pixel_mark(icon),_=>draw_mark(icon) };
-        let mark_color=match m.provider_mark {
+        let mark = match m.provider_mark {
+            1 => draw_codex_mark(icon),
+            2 => draw_spark_mark(icon),
+            _ if m.pixel_icon => draw_pixel_mark(icon),
+            _ => draw_mark(icon),
+        };
+        let mark_color = match m.provider_mark {
             2 if m.spark_down => pal.crit,
             2 => pal.label,
             1 => RING_BLUE,
@@ -1018,7 +1199,12 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         for y in 0..icon {
             for xx in 0..icon {
                 let cov = mark[(y * icon + xx) as usize];
-                over(&mut buf, ((iy + y) * w + icon_x + xx) as usize, dim(all_stale, mark_color), cov);
+                over(
+                    &mut buf,
+                    ((iy + y) * w + icon_x + xx) as usize,
+                    dim(all_stale, mark_color),
+                    cov,
+                );
             }
         }
 
@@ -1029,7 +1215,9 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                     let i = (y * w + xx) as usize;
                     // Motion blur: a vertical box average kept inside the glyph's own line box.
                     let mut sum = [0u32; 3];
-                    for yy in (y - seg.blur..=y + seg.blur).filter(|yy| (seg.y0.max(0)..seg.y1.min(h)).contains(yy)) {
+                    for yy in (y - seg.blur..=y + seg.blur)
+                        .filter(|yy| (seg.y0.max(0)..seg.y1.min(h)).contains(yy))
+                    {
                         let mk = mask[(yy * w + xx) as usize];
                         (0..3).for_each(|c| sum[c] += mk[c] as u32);
                     }
@@ -1062,11 +1250,36 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                 }
             })
             .collect();
-        Frame { w, h, px, groups: Vec::new() }
+        Frame {
+            w,
+            h,
+            px,
+            groups: Vec::new(),
+        }
     }
 }
 
-fn draw_codex_mark(size:i32)->Vec<f32>{ let mut o=vec![0.0;(size*size)as usize];let c=(size-1)as f32/2.0;let r=c*0.82;for y in 0..size{for x in 0..size{let dx=x as f32-c;let dy=y as f32-c;let a=dy.atan2(dx);let hex=r*(std::f32::consts::PI/6.0).cos()/((a.rem_euclid(std::f32::consts::PI/3.0)-std::f32::consts::PI/6.0).cos());let d=(dx*dx+dy*dy).sqrt();if(d-hex).abs()<1.4||(d<r*0.48&&((dx+dy).abs()<1.2||(dx-dy).abs()<1.2)){o[(y*size+x)as usize]=1.0}}}o}
+fn draw_codex_mark(size: i32) -> Vec<f32> {
+    let mut o = vec![0.0; (size * size) as usize];
+    let c = (size - 1) as f32 / 2.0;
+    let r = c * 0.82;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - c;
+            let dy = y as f32 - c;
+            let a = dy.atan2(dx);
+            let hex = r * (std::f32::consts::PI / 6.0).cos()
+                / ((a.rem_euclid(std::f32::consts::PI / 3.0) - std::f32::consts::PI / 6.0).cos());
+            let d = (dx * dx + dy * dy).sqrt();
+            if (d - hex).abs() < 1.4
+                || (d < r * 0.48 && ((dx + dy).abs() < 1.2 || (dx - dy).abs() < 1.2))
+            {
+                o[(y * size + x) as usize] = 1.0
+            }
+        }
+    }
+    o
+}
 fn draw_spark_mark(size: i32) -> Vec<f32> {
     let mut out = vec![0.0; (size * size) as usize];
     let n = size as f32;
@@ -1092,10 +1305,12 @@ fn draw_spark_mark(size: i32) -> Vec<f32> {
             let mut coverage = (outer - inner).max(0.0);
             for position in [0.39, 0.61] {
                 let along = n * position;
-                let horizontal = py >= along - pin_half && py <= along + pin_half
+                let horizontal = py >= along - pin_half
+                    && py <= along + pin_half
                     && ((px >= left - pin_length && px <= left)
                         || (px >= right && px <= right + pin_length));
-                let vertical = px >= along - pin_half && px <= along + pin_half
+                let vertical = px >= along - pin_half
+                    && px <= along + pin_half
                     && ((py >= top - pin_length && py <= top)
                         || (py >= bottom && py <= bottom + pin_length));
                 if horizontal || vertical {
@@ -1172,7 +1387,9 @@ fn draw_mark(size: i32) -> Vec<f32> {
     let n = 12;
     let c = size as f32 / 2.0;
     let r = size as f32 / 2.0;
-    let lens = [1.0, 0.82, 0.95, 0.78, 1.0, 0.86, 0.92, 0.8, 0.98, 0.84, 0.9, 0.8];
+    let lens = [
+        1.0, 0.82, 0.95, 0.78, 1.0, 0.86, 0.92, 0.8, 0.98, 0.84, 0.9, 0.8,
+    ];
     let half_w = (size as f32 * 0.052).max(0.8);
     let spokes: Vec<(f32, f32)> = (0..n)
         .map(|i| {

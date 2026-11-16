@@ -71,7 +71,10 @@ impl FetchError {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 /// The folder Claude Code uses when started plainly: `CLAUDE_CONFIG_DIR`,
@@ -101,7 +104,10 @@ pub fn account_label(dir: &Path) -> String {
     // With CLAUDE_CONFIG_DIR, `.claude.json` sits inside the folder;
     // for the default `~/.claude` it sits next to it, in the home folder.
     let mut candidates = vec![dir.join(".claude.json")];
-    if dir.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".claude")) {
+    if dir
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case(".claude"))
+    {
         if let Some(parent) = dir.parent() {
             candidates.push(parent.join(".claude.json"));
         }
@@ -110,7 +116,11 @@ pub fn account_label(dir: &Path) -> String {
         let email = fs::read_to_string(&path)
             .ok()
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .and_then(|v| v["oauthAccount"]["emailAddress"].as_str().map(str::to_string));
+            .and_then(|v| {
+                v["oauthAccount"]["emailAddress"]
+                    .as_str()
+                    .map(str::to_string)
+            });
         if let Some(e) = email.filter(|e| !e.is_empty()) {
             return e;
         }
@@ -131,7 +141,10 @@ fn load_creds(dir: &Path) -> Result<Creds, FetchError> {
     let text = fs::read_to_string(creds_path(dir)).map_err(|_| FetchError::NoLogin)?;
     let root: Value = serde_json::from_str(&text).map_err(|_| FetchError::NoLogin)?;
     let o = &root["claudeAiOauth"];
-    let access = o["accessToken"].as_str().ok_or(FetchError::NoLogin)?.to_string();
+    let access = o["accessToken"]
+        .as_str()
+        .ok_or(FetchError::NoLogin)?
+        .to_string();
     Ok(Creds {
         refresh: o["refreshToken"].as_str().map(str::to_string),
         expires_at: o["expiresAt"].as_i64(),
@@ -190,7 +203,11 @@ fn refresh(dir: &Path, rejected: Option<&str>) -> Result<String, FetchError> {
     let refresh_token = c.refresh.clone().ok_or(FetchError::LoginExpired)?;
     let scopes: Vec<String> = c.root["claudeAiOauth"]["scopes"]
         .as_array()
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     let mut body = json!({
         "grant_type": "refresh_token",
@@ -212,7 +229,11 @@ fn refresh(dir: &Path, rejected: Option<&str>) -> Result<String, FetchError> {
         200 => {}
         400 | 401 | 403 => return Err(FetchError::LoginExpired),
         429 => return Err(FetchError::RateLimited),
-        s => return Err(FetchError::Other(format!("Token refresh failed (HTTP {s})"))),
+        s => {
+            return Err(FetchError::Other(format!(
+                "Token refresh failed (HTTP {s})"
+            )))
+        }
     }
     let r: Value = serde_json::from_slice(&resp.body)
         .map_err(|_| FetchError::Other("Bad token response".into()))?;
@@ -230,11 +251,16 @@ fn refresh(dir: &Path, rejected: Option<&str>) -> Result<String, FetchError> {
         o["expiresAt"] = json!(now + sec * 1000);
     }
     if let Some(scope) = r["scope"].as_str() {
-        o["scopes"] = json!(scope.split(' ').filter(|s| !s.is_empty()).collect::<Vec<_>>());
+        o["scopes"] = json!(scope
+            .split(' ')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>());
     }
     if let Some(sec) = r["refresh_token_expires_in"].as_i64() {
         let new = now + sec * 1000;
-        let keep = o["refreshTokenExpiresAt"].as_i64().map_or(new, |old| old.min(new));
+        let keep = o["refreshTokenExpiresAt"]
+            .as_i64()
+            .map_or(new, |old| old.min(new));
         o["refreshTokenExpiresAt"] = json!(keep);
     }
     // Atomic replace so Claude Code never sees a half-written file.
@@ -272,7 +298,11 @@ pub fn fake_usage() -> Usage {
         SEED.with(|s| {
             let mut x = s.get();
             if x == 0 {
-                x = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 | 1;
+                x = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64
+                    | 1;
             }
             x ^= x << 13;
             x ^= x >> 7;
@@ -284,20 +314,32 @@ pub fn fake_usage() -> Usage {
     let now = now_ms() / 1000;
     let limit = |window_secs: u64| {
         let percent = (next() % 1001) as f64 / 10.0;
-        Limit { percent, resets_at: Some(now + (next() % window_secs) as i64 + 60) }
+        Limit {
+            percent,
+            resets_at: Some(now + (next() % window_secs) as i64 + 60),
+        }
     };
     Usage {
         five_hour: Some(limit(5 * 3600)),
         has_five_hour: true,
         weekly: Some(limit(7 * 86400)),
         fable: Some(limit(7 * 86400)),
-        extra: vec![ExtraLimit { key: "opus".into(), label: "Opus".into(), limit: limit(7 * 86400), window_secs: 7 * 86400 }],
+        extra: vec![ExtraLimit {
+            key: "opus".into(),
+            label: "Opus".into(),
+            limit: limit(7 * 86400),
+            window_secs: 7 * 86400,
+        }],
     }
 }
 
 pub fn fetch(dir: &Path) -> Result<Usage, FetchError> {
     let c = load_creds(dir)?;
-    let mut token = if needs_refresh(&c) { refresh(dir, None)? } else { c.access };
+    let mut token = if needs_refresh(&c) {
+        refresh(dir, None)?
+    } else {
+        c.access
+    };
     let mut resp = get_usage(&token)?;
     if resp.status == 401 {
         token = refresh(dir, Some(&token))?;
@@ -307,7 +349,11 @@ pub fn fetch(dir: &Path) -> Result<Usage, FetchError> {
         200 => {}
         401 | 403 => return Err(FetchError::LoginExpired),
         429 => return Err(FetchError::RateLimited),
-        s => return Err(FetchError::Other(format!("Usage request failed (HTTP {s})"))),
+        s => {
+            return Err(FetchError::Other(format!(
+                "Usage request failed (HTTP {s})"
+            )))
+        }
     }
     let v: Value = serde_json::from_slice(&resp.body)
         .map_err(|_| FetchError::Other("Bad usage response".into()))?;
@@ -319,7 +365,10 @@ pub(crate) fn parse_usage(v: &Value) -> Usage {
         let o = v.get(key)?;
         Some(Limit {
             percent: o.get("utilization")?.as_f64()?,
-            resets_at: o.get("resets_at").and_then(Value::as_str).and_then(parse_iso8601),
+            resets_at: o
+                .get("resets_at")
+                .and_then(Value::as_str)
+                .and_then(parse_iso8601),
         })
     };
     // Per-model weekly limits come as a list, the way Claude Code reads them:
@@ -327,22 +376,51 @@ pub(crate) fn parse_usage(v: &Value) -> Usage {
     let mut extra = Vec::new();
     if let Some(o) = v.as_object() {
         for (key, val) in o {
-            if matches!(key.as_str(), "five_hour" | "seven_day" | "limits") || !val.is_object() || val.get("utilization").is_none() { continue; }
+            if matches!(key.as_str(), "five_hour" | "seven_day" | "limits")
+                || !val.is_object()
+                || val.get("utilization").is_none()
+            {
+                continue;
+            }
             if let Some(l) = limit(key) {
                 let label = key.trim_start_matches("seven_day_").replace('_', " ");
-                extra.push(ExtraLimit { key: key.clone(), label, limit: l, window_secs: 7 * 86400 });
+                extra.push(ExtraLimit {
+                    key: key.clone(),
+                    label,
+                    limit: l,
+                    window_secs: 7 * 86400,
+                });
             }
         }
     }
     if let Some(limits) = v["limits"].as_array() {
         for item in limits {
-            if item["kind"].as_str() != Some("weekly_scoped") { continue; }
-            let Some(label) = item["scope"]["model"]["display_name"].as_str() else { continue };
-            let Some(percent) = item["percent"].as_f64().or_else(|| item["utilization"].as_f64()) else { continue };
-            let at=&item["resets_at"];
-            let limit=Limit { percent, resets_at: at.as_i64().or_else(||at.as_str().and_then(parse_iso8601)) };
-            let key=label.to_ascii_lowercase().replace(' ', "_");
-            if !extra.iter().any(|e| e.key == key) { extra.push(ExtraLimit { key, label: label.into(), limit, window_secs: 7 * 86400 }); }
+            if item["kind"].as_str() != Some("weekly_scoped") {
+                continue;
+            }
+            let Some(label) = item["scope"]["model"]["display_name"].as_str() else {
+                continue;
+            };
+            let Some(percent) = item["percent"]
+                .as_f64()
+                .or_else(|| item["utilization"].as_f64())
+            else {
+                continue;
+            };
+            let at = &item["resets_at"];
+            let limit = Limit {
+                percent,
+                resets_at: at.as_i64().or_else(|| at.as_str().and_then(parse_iso8601)),
+            };
+            let key = label.to_ascii_lowercase().replace(' ', "_");
+            if !extra.iter().any(|e| e.key == key) {
+                extra.push(ExtraLimit {
+                    key,
+                    label: label.into(),
+                    limit,
+                    window_secs: 7 * 86400,
+                });
+            }
         }
     }
     Usage {
@@ -357,7 +435,9 @@ pub(crate) fn parse_usage(v: &Value) -> Usage {
 fn fable_limit(v: &Value) -> Option<Limit> {
     v["limits"].as_array()?.iter().find_map(|l| {
         let name = l["scope"]["model"]["display_name"].as_str()?;
-        if l["kind"].as_str() != Some("weekly_scoped") || !name.to_ascii_lowercase().contains("fable") {
+        if l["kind"].as_str() != Some("weekly_scoped")
+            || !name.to_ascii_lowercase().contains("fable")
+        {
             return None;
         }
         let at = &l["resets_at"];
@@ -420,7 +500,10 @@ mod tests {
         let u = super::parse_usage(&serde_json::json!({"five_hour": {"utilization": null}}));
         assert!(u.has_five_hour && u.five_hour.is_none());
         // No 5-hour limit on the plan.
-        for v in [serde_json::json!({"five_hour": null}), serde_json::json!({})] {
+        for v in [
+            serde_json::json!({"five_hour": null}),
+            serde_json::json!({}),
+        ] {
             let u = super::parse_usage(&v);
             assert!(!u.has_five_hour && u.five_hour.is_none());
         }
@@ -429,17 +512,29 @@ mod tests {
     #[test]
     fn iso() {
         assert_eq!(super::parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(super::parse_iso8601("2026-11-11T14:10:00.320228+00:00"), Some(1794406200));
-        assert_eq!(super::parse_iso8601("2026-11-11T16:10:00+02:00"), Some(1794406200));
+        assert_eq!(
+            super::parse_iso8601("2026-11-11T14:10:00.320228+00:00"),
+            Some(1794406200)
+        );
+        assert_eq!(
+            super::parse_iso8601("2026-11-11T16:10:00+02:00"),
+            Some(1794406200)
+        );
     }
 
     #[test]
     fn discovers_extra_quotas() {
-        let u=super::parse_usage(&serde_json::json!({
+        let u = super::parse_usage(&serde_json::json!({
             "seven_day_opus":{"utilization":22.0,"resets_at":"1970-01-02T00:00:00Z"},
             "limits":[{"kind":"weekly_scoped","scope":{"model":{"display_name":"Sonnet Pro"}},"percent":31.0,"resets_at":90000}]
         }));
-        assert!(u.extra.iter().any(|x|x.key=="seven_day_opus"&&x.limit.percent==22.0));
-        assert!(u.extra.iter().any(|x|x.label=="Sonnet Pro"&&x.limit.percent==31.0));
+        assert!(u
+            .extra
+            .iter()
+            .any(|x| x.key == "seven_day_opus" && x.limit.percent == 22.0));
+        assert!(u
+            .extra
+            .iter()
+            .any(|x| x.label == "Sonnet Pro" && x.limit.percent == 31.0));
     }
 }

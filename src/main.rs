@@ -4,8 +4,8 @@ mod api;
 mod flyout;
 mod http;
 mod mcp;
-mod providers;
 mod preview;
+mod providers;
 mod render;
 mod storage;
 mod tokens;
@@ -16,24 +16,26 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use windows_sys::core::w;
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS};
 use windows_sys::Win32::Graphics::Gdi::*;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
-use windows_sys::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS};
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows_sys::Win32::UI::Shell::{
-    SHBrowseForFolderW, SHGetPathFromIDListW, ShellExecuteW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
-    BROWSEINFOW, Shell_NotifyIconW, NOTIFYICONDATAW, NIF_ICON, NIF_INFO, NIIF_INFO, NIM_ADD,
-    NIM_DELETE,
+    SHBrowseForFolderW, SHGetPathFromIDListW, ShellExecuteW, Shell_NotifyIconW, BIF_NEWDIALOGSTYLE,
+    BIF_RETURNONLYFSDIRS, BROWSEINFOW, NIF_ICON, NIF_INFO, NIIF_INFO, NIM_ADD, NIM_DELETE,
+    NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
-use windows_sys::core::w;
 
 const WM_APP_RESULT: u32 = WM_APP + 1;
 const WM_APP_CSWAP: u32 = WM_APP + 2; // claude-swap finished; lparam: Box<Result<(), String>>
@@ -113,7 +115,12 @@ const FONT_SIZES: [(u32, &str); 6] = [
     (18, "Largest"),
 ];
 /// Icon size choices (pixels at 100% scaling, menu label).
-const ICON_SIZES: [(u32, &str); 4] = [(14, "Small"), (18, "Default"), (22, "Large"), (26, "Largest")];
+const ICON_SIZES: [(u32, &str); 4] = [
+    (14, "Small"),
+    (18, "Default"),
+    (22, "Large"),
+    (26, "Largest"),
+];
 const DEFAULT_ICON_SIZE: u32 = 18;
 use render::DEFAULT_FONT_SIZE;
 
@@ -170,7 +177,17 @@ struct Account {
 impl Account {
     fn new(id: u32, dir: PathBuf) -> Account {
         let label = api::account_label(&dir);
-        Account { id, dir, label, usage: None, prev: None, last_ok: None, error: None, fetching: false, rate_limited: 0 }
+        Account {
+            id,
+            dir,
+            label,
+            usage: None,
+            prev: None,
+            last_ok: None,
+            error: None,
+            fetching: false,
+            rate_limited: 0,
+        }
     }
 
     fn is_stale(&self) -> bool {
@@ -275,7 +292,10 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
 }
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn main() {
@@ -284,7 +304,10 @@ fn main() {
         mcp::run();
         return;
     }
-    if let Some(index) = arguments.iter().position(|argument| argument == "--preview") {
+    if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--preview")
+    {
         let Some(directory) = arguments.get(index + 1) else {
             println!("--preview requires an output directory");
             return;
@@ -301,15 +324,26 @@ fn main() {
     }
     unsafe {
         let m = CreateMutexW(null(), 0, w!("Local\\TaskbarUsageWidget.Singleton"));
-        if GetLastError() == ERROR_ALREADY_EXISTS { CloseHandle(m); return; }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(m);
+            return;
+        }
         // The folder picker needs COM on this thread.
         CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
         let hinst = GetModuleHandleW(null());
         let cursor = LoadCursorW(null_mut(), IDC_ARROW);
         flyout::register();
         for (name, proc_) in [
-            (w!("TaskbarUsageCtl"), Some(ctl_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT)),
-            (w!("TaskbarUsageWidget"), Some(widget_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT)),
+            (
+                w!("TaskbarUsageCtl"),
+                Some(ctl_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
+            ),
+            (
+                w!("TaskbarUsageWidget"),
+                Some(
+                    widget_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                ),
+            ),
         ] {
             let wc = WNDCLASSW {
                 lpfnWndProc: proc_,
@@ -329,8 +363,18 @@ fn main() {
         // Hidden top-level window: owns timers and receives broadcasts
         // (TaskbarCreated, theme changes) that a taskbar child would not.
         let ctl = CreateWindowExW(
-            WS_EX_TOOLWINDOW, w!("TaskbarUsageCtl"), w!("Taskbar Usage Widget"), WS_POPUP,
-            0, 0, 0, 0, null_mut(), null_mut(), hinst, null(),
+            WS_EX_TOOLWINDOW,
+            w!("TaskbarUsageCtl"),
+            w!("Taskbar Usage Widget"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            null_mut(),
+            null_mut(),
+            hinst,
+            null(),
         );
         let msg = RegisterWindowMessageW(w!("TaskbarCreated"));
         with(|s| {
@@ -409,7 +453,11 @@ fn start_fetch(id: u32) {
     let Some((ctl, dir, fake)) = job else { return };
     unsafe { KillTimer(ctl as HWND, T_FETCH_BASE + id as usize) };
     std::thread::spawn(move || {
-        let r = if fake { Ok(api::fake_usage()) } else { api::fetch(&dir) };
+        let r = if fake {
+            Ok(api::fake_usage())
+        } else {
+            api::fetch(&dir)
+        };
         let label = api::account_label(&dir);
         let msg = Box::new(FetchResult { id, label, r });
         unsafe { PostMessageW(ctl as HWND, WM_APP_RESULT, 0, Box::into_raw(msg) as LPARAM) };
@@ -439,7 +487,11 @@ fn on_result(res: FetchResult) {
         let limited = matches!(res.r, Err(api::FetchError::RateLimited));
         match res.r {
             Ok(u) => {
-                a.prev = a.usage.clone().filter(|_| roll).map(|old| (old, Instant::now()));
+                a.prev = a
+                    .usage
+                    .clone()
+                    .filter(|_| roll)
+                    .map(|old| (old, Instant::now()));
                 a.usage = Some(u);
                 a.last_ok = Some(now());
                 a.error = None;
@@ -483,7 +535,7 @@ fn on_result(res: FetchResult) {
     }
     ensure_widget();
     update_tooltip();
-    with(|s| persist_state(s,now()));
+    with(|s| persist_state(s, now()));
     for notice in with(evaluate_alerts) {
         show_alert(&notice);
     }
@@ -515,9 +567,17 @@ fn ensure_widget() {
             }
             widget = CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                w!("TaskbarUsageWidget"), w!("Taskbar Usage Widget"),
+                w!("TaskbarUsageWidget"),
+                w!("Taskbar Usage Widget"),
                 WS_CHILD | WS_CLIPSIBLINGS,
-                0, 0, 1, 1, taskbar, null_mut(), GetModuleHandleW(null()), null(),
+                0,
+                0,
+                1,
+                1,
+                taskbar,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
             );
             if widget.is_null() {
                 return;
@@ -544,7 +604,11 @@ fn ensure_widget() {
         // A vertical taskbar (ExplorerPatcher, Windhawk, Windows 10) is taller than wide:
         // the widget then stacks its lines and `h` is the bar's width.
         let vertical = tb.bottom - tb.top > tb.right - tb.left;
-        let h = if vertical { tb.right - tb.left } else { tb.bottom - tb.top };
+        let h = if vertical {
+            tb.right - tb.left
+        } else {
+            tb.bottom - tb.top
+        };
         let dpi = GetDpiForWindow(taskbar).max(96);
         let scale = dpi as f32 / 96.0;
 
@@ -561,11 +625,44 @@ fn ensure_widget() {
                         roll: a.prev.as_ref().and_then(|(o, at)| {
                             let t = at.elapsed().as_secs_f32() / ROLL_SECS;
                             let pct = |l: Option<api::Limit>| l.map(|l| l.percent);
-                            (t < 1.0).then_some(([pct(o.five_hour), pct(o.weekly), pct(o.fable)], t))
+                            (t < 1.0)
+                                .then_some(([pct(o.five_hour), pct(o.weekly), pct(o.fable)], t))
                         }),
                         stale: a.is_stale(),
-                        pace: [u.five_hour.and_then(|l|l.resets_at.map(|r|providers::pace(l.percent,Some(r),Some(18000),now(),None).elapsed_frac as f32)),u.weekly.and_then(|l|l.resets_at.map(|r|providers::pace(l.percent,Some(r),Some(604800),now(),None).elapsed_frac as f32)),u.fable.and_then(|l|l.resets_at.map(|r|providers::pace(l.percent,Some(r),Some(604800),now(),None).elapsed_frac as f32))],
-                        projected: [u.five_hour.map(|l|providers::pace(l.percent,l.resets_at,Some(18000),now(),None).projected as f32),u.weekly.map(|l|providers::pace(l.percent,l.resets_at,Some(604800),now(),None).projected as f32),u.fable.map(|l|providers::pace(l.percent,l.resets_at,Some(604800),now(),None).projected as f32)],
+                        pace: [
+                            u.five_hour.and_then(|l| {
+                                l.resets_at.map(|r| {
+                                    providers::pace(l.percent, Some(r), Some(18000), now(), None)
+                                        .elapsed_frac as f32
+                                })
+                            }),
+                            u.weekly.and_then(|l| {
+                                l.resets_at.map(|r| {
+                                    providers::pace(l.percent, Some(r), Some(604800), now(), None)
+                                        .elapsed_frac as f32
+                                })
+                            }),
+                            u.fable.and_then(|l| {
+                                l.resets_at.map(|r| {
+                                    providers::pace(l.percent, Some(r), Some(604800), now(), None)
+                                        .elapsed_frac as f32
+                                })
+                            }),
+                        ],
+                        projected: [
+                            u.five_hour.map(|l| {
+                                providers::pace(l.percent, l.resets_at, Some(18000), now(), None)
+                                    .projected as f32
+                            }),
+                            u.weekly.map(|l| {
+                                providers::pace(l.percent, l.resets_at, Some(604800), now(), None)
+                                    .projected as f32
+                            }),
+                            u.fable.map(|l| {
+                                providers::pace(l.percent, l.resets_at, Some(604800), now(), None)
+                                    .projected as f32
+                            }),
+                        ],
                         text: [None, None, None],
                         critical: [false; 3],
                     }
@@ -573,8 +670,13 @@ fn ensure_widget() {
                 .collect();
             // Plans without a 5-hour limit (Ultra) report none: hide the group
             // on its own once every loaded account says so.
-            let mut loaded = s.accounts.iter().filter_map(|a| a.usage.as_ref()).peekable();
-            let hide_five = s.hide_five || (loaded.peek().is_some() && loaded.all(|u| !u.has_five_hour));
+            let mut loaded = s
+                .accounts
+                .iter()
+                .filter_map(|a| a.usage.as_ref())
+                .peekable();
+            let hide_five =
+                s.hide_five || (loaded.peek().is_some() && loaded.all(|u| !u.has_five_hour));
             let key = RenderKey {
                 h,
                 vertical,
@@ -585,7 +687,13 @@ fn ensure_widget() {
                     .iter()
                     .map(|r| {
                         let pct = |v: Option<f64>| v.map(|p| p.round() as i64);
-                        (pct(r.five), pct(r.week), pct(r.fable), r.stale, r.roll.map(|(_, t)| (t * 1000.0) as u32))
+                        (
+                            pct(r.five),
+                            pct(r.week),
+                            pct(r.fable),
+                            r.stale,
+                            r.roll.map(|(_, t)| (t * 1000.0) as u32),
+                        )
                     })
                     .collect(),
                 show_left: s.show_left,
@@ -620,13 +728,42 @@ fn ensure_widget() {
                     },
                 ),
             };
-            let codex_rows=s.codex.as_ref().map(|c|{
-                let find=|k:&str|c.windows.iter().find(|w|w.key==k);
-                let mk=|w:Option<&providers::Window>|w.map(|x|x.percent);
-                let pp=|w:Option<&providers::Window>|w.map(|x|providers::pace(x.percent,x.resets_at,x.window_secs,now(),None));
-                let f=find("5h");let w=find("week");let pf=pp(f);let pw=pp(w);
-                vec![render::Row{five:mk(f),week:mk(w),fable:None,roll:None,stale:c.error.is_some()||now()-c.as_of>21600,pace:[pf.map(|p|p.elapsed_frac as f32),pw.map(|p|p.elapsed_frac as f32),None],projected:[pf.map(|p|p.projected as f32),pw.map(|p|p.projected as f32),None],text:[None,None,None],critical:[false;3]}]
-            }).unwrap_or_default();
+            let codex_rows = s
+                .codex
+                .as_ref()
+                .map(|c| {
+                    let find = |k: &str| c.windows.iter().find(|w| w.key == k);
+                    let mk = |w: Option<&providers::Window>| w.map(|x| x.percent);
+                    let pp = |w: Option<&providers::Window>| {
+                        w.map(|x| {
+                            providers::pace(x.percent, x.resets_at, x.window_secs, now(), None)
+                        })
+                    };
+                    let f = find("5h");
+                    let w = find("week");
+                    let pf = pp(f);
+                    let pw = pp(w);
+                    vec![render::Row {
+                        five: mk(f),
+                        week: mk(w),
+                        fable: None,
+                        roll: None,
+                        stale: c.error.is_some() || now() - c.as_of > 21600,
+                        pace: [
+                            pf.map(|p| p.elapsed_frac as f32),
+                            pw.map(|p| p.elapsed_frac as f32),
+                            None,
+                        ],
+                        projected: [
+                            pf.map(|p| p.projected as f32),
+                            pw.map(|p| p.projected as f32),
+                            None,
+                        ],
+                        text: [None, None, None],
+                        critical: [false; 3],
+                    }]
+                })
+                .unwrap_or_default();
             let spark_row = s.spark.as_ref().map(|spark| {
                 let down = spark.error.is_some() || !spark.up;
                 let text = if down {
@@ -668,15 +805,15 @@ fn ensure_widget() {
                 hide_week: s.hide_week,
                 hide_fable: s.hide_fable,
                 rows_per_col: s.rows_per_col as usize,
-                provider_mark:0,
+                provider_mark: 0,
                 codex_rows,
                 spark_row,
-                show_claude:s.show_claude,
-                show_codex:s.show_codex,
-                show_spark:s.show_spark&&!s.spark_host.is_empty(),
-                spark_points:s.spark_history.iter().map(|x|x.1 as f32).collect(),
-                spark_busy:s.spark.as_ref().is_some_and(|x|x.busy),
-                spark_down:s.spark.as_ref().is_some_and(|x|x.error.is_some()||!x.up),
+                show_claude: s.show_claude,
+                show_codex: s.show_codex,
+                show_spark: s.show_spark && !s.spark_host.is_empty(),
+                spark_points: s.spark_history.iter().map(|x| x.1 as f32).collect(),
+                spark_busy: s.spark.as_ref().is_some_and(|x| x.busy),
+                spark_down: s.spark.as_ref().is_some_and(|x| x.error.is_some() || !x.up),
                 spark_pulse_alpha: spark_pulse_alpha(),
             };
             let changed = s.rendered.as_ref() != Some(&key);
@@ -699,11 +836,19 @@ fn ensure_widget() {
         let on_left = with(|s| s.on_left);
         let pos = if vertical {
             // Centered across the bar, above the tray, or at the top with "left side".
-            let y = if on_left { gap } else { tr.top - tb.top - wh - gap };
+            let y = if on_left {
+                gap
+            } else {
+                tr.top - tb.top - wh - gap
+            };
             (((h - w) / 2).max(0), y.max(0), w, wh)
         } else {
             // The left end is free on a centered taskbar (unless the Widgets button is on).
-            let x = if on_left { gap } else { tr.left - tb.left - w - gap };
+            let x = if on_left {
+                gap
+            } else {
+                tr.left - tb.left - w - gap
+            };
             (x.max(0), 0, w, h)
         };
         let moved = with(|s| {
@@ -714,8 +859,15 @@ fn ensure_widget() {
         // Stay above the taskbar's own XAML content.
         let on_top = GetWindow(taskbar, GW_CHILD) == widget;
         if moved || !on_top || IsWindowVisible(widget) == 0 {
-            SetWindowPos(widget, HWND_TOP, pos.0, pos.1, pos.2, pos.3,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            SetWindowPos(
+                widget,
+                HWND_TOP,
+                pos.0,
+                pos.1,
+                pos.2,
+                pos.3,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
         }
     }
 }
@@ -746,7 +898,17 @@ unsafe fn present(widget: HWND, f: &render::Frame) {
         SourceConstantAlpha: 255,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
-    UpdateLayeredWindow(widget, null_mut(), null(), &size, dc, &src, 0, &blend, ULW_ALPHA);
+    UpdateLayeredWindow(
+        widget,
+        null_mut(),
+        null(),
+        &size,
+        dc,
+        &src,
+        0,
+        &blend,
+        ULW_ALPHA,
+    );
     SelectObject(dc, old);
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -812,7 +974,9 @@ fn tooltip_text(s: &State) -> String {
             if u.fable.is_some() {
                 out += &line("Fable (weekly)", u.fable, true);
             }
-            for e in &u.extra { out += &line(&e.label,Some(e.limit),true); }
+            for e in &u.extra {
+                out += &line(&e.label, Some(e.limit), true);
+            }
         }
         if let Some(t) = a.last_ok {
             out += &format!("\n{indent}Updated {}", local_time(t, false));
@@ -825,9 +989,52 @@ fn tooltip_text(s: &State) -> String {
     }
     if s.show_codex {
         out += "\n\nCodex";
-        if let Some(c)=&s.codex { if let Some(p)=&c.plan_type{out+=&format!(" ({p})");} for w in &c.windows { let p=providers::pace(w.percent,w.resets_at,w.window_secs,now(),None); out+=&format!("\n{}: {:.0}% used - {}",w.label,w.percent,providers::forecast_wording(p,w.resets_at)); if let Some(r)=w.resets_at{out+=&format!(" - Resets in {}",providers::resets_in(r-now()));} if w.reset_since_last_run{out+=" (reset since last Codex run)";} } if now()-c.as_of>21600{out+="\n(stale)";} if let Some(e)=&c.error{out+=&format!("\n{e}");} } else {out+="\nLoading...";}
+        if let Some(c) = &s.codex {
+            if let Some(p) = &c.plan_type {
+                out += &format!(" ({p})");
+            }
+            for w in &c.windows {
+                let p = providers::pace(w.percent, w.resets_at, w.window_secs, now(), None);
+                out += &format!(
+                    "\n{}: {:.0}% used - {}",
+                    w.label,
+                    w.percent,
+                    providers::forecast_wording(p, w.resets_at)
+                );
+                if let Some(r) = w.resets_at {
+                    out += &format!(" - Resets in {}", providers::resets_in(r - now()));
+                }
+                if w.reset_since_last_run {
+                    out += " (reset since last Codex run)";
+                }
+            }
+            if now() - c.as_of > 21600 {
+                out += "\n(stale)";
+            }
+            if let Some(e) = &c.error {
+                out += &format!("\n{e}");
+            }
+        } else {
+            out += "\nLoading...";
+        }
     }
-    if s.show_spark&&!s.spark_host.is_empty(){out+="\n\nSpark";if let Some(sp)=&s.spark{if let Some(e)=&sp.error{out+=&format!("\nDown: {e}");}else{out+=&format!("\n{} - {:.0} t/s - GPU {:.0}%",if sp.busy{"Busy"}else{"Idle"},sp.tok_s,sp.gpu_util);}}else{out+="\nLoading...";}}
+    if s.show_spark && !s.spark_host.is_empty() {
+        out += "\n\nSpark";
+        if let Some(sp) = &s.spark {
+            if let Some(e) = &sp.error {
+                out += &format!("\nDown: {e}");
+            } else {
+                out += &format!(
+                    "\n{} - {:.0} t/s - GPU {:.0}%",
+                    if sp.busy { "Busy" } else { "Idle" },
+                    sp.tok_s,
+                    sp.gpu_util
+                );
+            }
+        } else {
+            out += "\nLoading...";
+        }
+    }
     out
 }
 
@@ -839,7 +1046,11 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
             let mut section = flyout::Section {
                 provider: flyout::ProviderKind::Claude,
                 title: "Claude".into(),
-                chip: if s.accounts.len() > 1 { format!("account {}", index + 1) } else { String::new() },
+                chip: if s.accounts.len() > 1 {
+                    format!("account {}", index + 1)
+                } else {
+                    String::new()
+                },
                 stale: reading.error.is_some() || t - reading.as_of > 600,
                 error: reading.error.clone(),
                 ..Default::default()
@@ -848,7 +1059,11 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
             section.today = if s.tokens_checked_at == 0 {
                 "Today: counting...".into()
             } else {
-                format!("Today: {} tokens · {} out", compact_number(s.token_totals.claude), compact_number(s.token_totals.claude_output))
+                format!(
+                    "Today: {} tokens · {} out",
+                    compact_number(s.token_totals.claude),
+                    compact_number(s.token_totals.claude_output)
+                )
             };
             if let Some(history) = &s.history {
                 section.chart = history
@@ -866,13 +1081,21 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
             let mut section = flyout::Section {
                 provider: flyout::ProviderKind::Codex,
                 title: "Codex".into(),
-                chip: reading.plan_type.as_deref().map(title_case).unwrap_or_default(),
+                chip: reading
+                    .plan_type
+                    .as_deref()
+                    .map(title_case)
+                    .unwrap_or_default(),
                 stale: reading.error.is_some() || t - reading.as_of > 21600,
                 error: reading.error.clone(),
                 ..Default::default()
             };
             add_flyout_windows(&mut section, reading, t);
-            section.today = if s.tokens_checked_at == 0 { "Today: counting...".into() } else { format!("Today: {} tokens", compact_number(s.token_totals.codex)) };
+            section.today = if s.tokens_checked_at == 0 {
+                "Today: counting...".into()
+            } else {
+                format!("Today: {} tokens", compact_number(s.token_totals.codex))
+            };
             section.as_of = format!("as of {} ago", human_short(t - reading.as_of));
             sections.push(section);
         }
@@ -905,19 +1128,27 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                 .map(|sample| sample.1)
                 .fold(0.0f64, f64::max);
             section.spark = Some(flyout::SparkStats {
-                tok_s: spark.tok_s, peak, running, waiting,
+                tok_s: spark.tok_s,
+                peak,
+                running,
+                waiting,
                 kv_pct: endpoint.and_then(|value| value["kv_pct"].as_f64()),
-                ttft_ms: endpoint.and_then(|value| value["ttft_ms"].as_f64().or_else(|| value["ttft"].as_f64())),
+                ttft_ms: endpoint
+                    .and_then(|value| value["ttft_ms"].as_f64().or_else(|| value["ttft"].as_f64())),
                 gpu_util: spark.gpu_util,
                 gpu_temp: spark.sys["gpu"]["temp"].as_f64(),
                 gpu_power: spark.sys["gpu"]["power"].as_f64(),
                 mem_pct: spark.sys["memory"]["pct"].as_f64(),
                 swap_pct: spark.sys["swap"]["pct"].as_f64(),
-                aux: spark.aux.iter().map(|service| flyout::AuxStatus {
-                    name: service["name"].as_str().unwrap_or("service").to_owned(),
-                    up: service["up"].as_bool().unwrap_or(false),
-                    busy: service["busy"].as_bool().unwrap_or(false),
-                }).collect(),
+                aux: spark
+                    .aux
+                    .iter()
+                    .map(|service| flyout::AuxStatus {
+                        name: service["name"].as_str().unwrap_or("service").to_owned(),
+                        up: service["up"].as_bool().unwrap_or(false),
+                        busy: service["busy"].as_bool().unwrap_or(false),
+                    })
+                    .collect(),
             });
             section.error = spark.error.clone();
             section.stale = t - spark.fetched_at > 30;
@@ -943,7 +1174,13 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
 
 fn add_flyout_windows(section: &mut flyout::Section, reading: &providers::Reading, t: i64) {
     for window in &reading.windows {
-        let pace = providers::pace(window.percent, window.resets_at, window.window_secs, t, None);
+        let pace = providers::pace(
+            window.percent,
+            window.resets_at,
+            window.window_secs,
+            t,
+            None,
+        );
         let reset = window
             .resets_at
             .map(|at| local_time(at, !same_local_day(at, t)))
@@ -955,7 +1192,9 @@ fn add_flyout_windows(section: &mut flyout::Section, reading: &providers::Readin
             reset,
             ahead_by: pace.ahead_by,
             projected: pace.projected,
-            full_at: pace.full_at.map(|at| local_time(at, !same_local_day(at, t))),
+            full_at: pace
+                .full_at
+                .map(|at| local_time(at, !same_local_day(at, t))),
         });
     }
 }
@@ -972,20 +1211,30 @@ fn compact_number(value: u64) -> String {
 
 fn human_short(seconds: i64) -> String {
     let seconds = seconds.max(0);
-    if seconds >= 3600 { format!("{} h", seconds / 3600) }
-    else if seconds >= 60 { format!("{} m", seconds / 60) }
-    else { format!("{} s", seconds) }
+    if seconds >= 3600 {
+        format!("{} h", seconds / 3600)
+    } else if seconds >= 60 {
+        format!("{} m", seconds / 60)
+    } else {
+        format!("{} s", seconds)
+    }
 }
 
 fn title_case(value: &str) -> String {
     let mut chars = value.chars();
-    chars.next().map(|first| first.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
 }
 
 fn same_local_day(left: i64, right: i64) -> bool {
     let date = |unix: i64| unsafe {
         let ticks = (unix + 11_644_473_600) as u64 * 10_000_000;
-        let file = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+        let file = FILETIME {
+            dwLowDateTime: ticks as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
         let mut utc = std::mem::zeroed();
         let mut local = std::mem::zeroed();
         FileTimeToSystemTime(&file, &mut utc);
@@ -996,9 +1245,7 @@ fn same_local_day(left: i64, right: i64) -> bool {
 }
 
 unsafe fn update_flyout() {
-    let (widget, dark, snapshot) = with(|state| {
-        (state.widget, state.dark, flyout_snapshot(state))
-    });
+    let (widget, dark, snapshot) = with(|state| (state.widget, state.dark, flyout_snapshot(state)));
     if widget.is_null() {
         return;
     }
@@ -1024,7 +1271,10 @@ fn countdown(secs: i64) -> String {
 pub(crate) fn local_time(unix: i64, with_day: bool) -> String {
     unsafe {
         let ft_val = (unix + 11_644_473_600) as u64 * 10_000_000;
-        let ft = FILETIME { dwLowDateTime: ft_val as u32, dwHighDateTime: (ft_val >> 32) as u32 };
+        let ft = FILETIME {
+            dwLowDateTime: ft_val as u32,
+            dwHighDateTime: (ft_val >> 32) as u32,
+        };
         let mut utc = std::mem::zeroed();
         let mut local = std::mem::zeroed();
         FileTimeToSystemTime(&ft, &mut utc);
@@ -1055,7 +1305,10 @@ fn system_dark() -> bool {
             HKEY_CURRENT_USER,
             w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
             w!("SystemUsesLightTheme"),
-            RRF_RT_REG_DWORD, null_mut(), &mut v as *mut u32 as *mut _, &mut size,
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            &mut v as *mut u32 as *mut _,
+            &mut size,
         )
     };
     r == ERROR_SUCCESS && v == 0
@@ -1065,16 +1318,29 @@ fn read_setting(name: &str) -> Option<u32> {
     let mut v: u32 = 0;
     let mut size = 4u32;
     let r = unsafe {
-        RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, wide(name).as_ptr(), RRF_RT_REG_DWORD,
-            null_mut(), &mut v as *mut u32 as *mut _, &mut size)
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            SETTINGS_KEY,
+            wide(name).as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            &mut v as *mut u32 as *mut _,
+            &mut size,
+        )
     };
     (r == ERROR_SUCCESS).then_some(v)
 }
 
 fn write_setting(name: &str, v: u32) {
     unsafe {
-        RegSetKeyValueW(HKEY_CURRENT_USER, SETTINGS_KEY, wide(name).as_ptr(), REG_DWORD,
-            &v as *const u32 as *const _, 4);
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            SETTINGS_KEY,
+            wide(name).as_ptr(),
+            REG_DWORD,
+            &v as *const u32 as *const _,
+            4,
+        );
     }
 }
 
@@ -1090,15 +1356,29 @@ fn read_string_setting(name: &str) -> Option<String> {
     let name = wide(name);
     let mut size = 0u32;
     unsafe {
-        if RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, name.as_ptr(), RRF_RT_REG_SZ,
-            null_mut(), null_mut(), &mut size) != ERROR_SUCCESS
+        if RegGetValueW(
+            HKEY_CURRENT_USER,
+            SETTINGS_KEY,
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            null_mut(),
+            null_mut(),
+            &mut size,
+        ) != ERROR_SUCCESS
         {
             return None;
         }
         let mut buf = vec![0u16; size as usize / 2 + 1];
         size = (buf.len() * 2) as u32;
-        if RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, name.as_ptr(), RRF_RT_REG_SZ,
-            null_mut(), buf.as_mut_ptr() as *mut _, &mut size) != ERROR_SUCCESS
+        if RegGetValueW(
+            HKEY_CURRENT_USER,
+            SETTINGS_KEY,
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            null_mut(),
+            buf.as_mut_ptr() as *mut _,
+            &mut size,
+        ) != ERROR_SUCCESS
         {
             return None;
         }
@@ -1110,8 +1390,14 @@ fn read_string_setting(name: &str) -> Option<String> {
 fn write_string_setting(name: &str, v: &str) {
     let v = wide(v);
     unsafe {
-        RegSetKeyValueW(HKEY_CURRENT_USER, SETTINGS_KEY, wide(name).as_ptr(), REG_SZ,
-            v.as_ptr() as *const _, (v.len() * 2) as u32);
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            SETTINGS_KEY,
+            wide(name).as_ptr(),
+            REG_SZ,
+            v.as_ptr() as *const _,
+            (v.len() * 2) as u32,
+        );
     }
 }
 
@@ -1135,19 +1421,32 @@ fn load_account_dirs() -> Vec<PathBuf> {
 
 fn save_accounts() {
     let joined = with(|s| {
-        s.accounts.iter().map(|a| a.dir.display().to_string()).collect::<Vec<_>>().join("|")
+        s.accounts
+            .iter()
+            .map(|a| a.dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join("|")
     });
     write_string_setting("Accounts", &joined);
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
-    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+    let norm = |p: &Path| {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    };
     norm(a) == norm(b)
 }
 
 unsafe fn message(text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
     let ctl = with(|s| s.ctl);
-    MessageBoxW(ctl, wide(text).as_ptr(), w!("Claude Usage Widget"), flags | MB_SETFOREGROUND)
+    MessageBoxW(
+        ctl,
+        wide(text).as_ptr(),
+        w!("Claude Usage Widget"),
+        flags | MB_SETFOREGROUND,
+    )
 }
 
 /// Asks for a folder with the standard Windows folder picker.
@@ -1196,7 +1495,10 @@ unsafe fn add_account() {
         picked
     };
     if with(|s| s.accounts.iter().any(|a| same_dir(&a.dir, &dir))) {
-        message("This account is already in the widget.", MB_OK | MB_ICONINFORMATION);
+        message(
+            "This account is already in the widget.",
+            MB_OK | MB_ICONINFORMATION,
+        );
         return;
     }
     let id = with(|s| {
@@ -1212,8 +1514,11 @@ unsafe fn add_account() {
 }
 
 unsafe fn remove_account(index: usize) {
-    let Some(label) = with(|s| s.accounts.get(index).map(|a| a.label.clone())) else { return };
-    let text = format!("Remove {label} from the widget?\n\nThis doesn't sign it out of Claude Code.");
+    let Some(label) = with(|s| s.accounts.get(index).map(|a| a.label.clone())) else {
+        return;
+    };
+    let text =
+        format!("Remove {label} from the widget?\n\nThis doesn't sign it out of Claude Code.");
     if message(&text, MB_YESNO | MB_ICONQUESTION) != IDYES {
         return;
     }
@@ -1230,8 +1535,15 @@ unsafe fn remove_account(index: usize) {
 fn autostart_enabled() -> bool {
     let mut size = 0u32;
     unsafe {
-        RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ,
-            null_mut(), null_mut(), &mut size) == ERROR_SUCCESS
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            RUN_KEY,
+            RUN_VALUE,
+            RRF_RT_REG_SZ,
+            null_mut(),
+            null_mut(),
+            &mut size,
+        ) == ERROR_SUCCESS
     }
 }
 
@@ -1240,8 +1552,14 @@ fn set_autostart(on: bool) {
         if on {
             let exe = std::env::current_exe().unwrap_or_default();
             let v = wide(&format!("\"{}\"", exe.display()));
-            RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, REG_SZ,
-                v.as_ptr() as *const _, (v.len() * 2) as u32);
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                RUN_KEY,
+                RUN_VALUE,
+                REG_SZ,
+                v.as_ptr() as *const _,
+                (v.len() * 2) as u32,
+            );
         } else {
             RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
         }
@@ -1259,7 +1577,9 @@ fn find_cswap() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("USERPROFILE") {
         dirs.push(PathBuf::from(home).join(".local").join("bin"));
     }
-    dirs.into_iter().map(|d| d.join("cswap.exe")).find(|p| p.is_file())
+    dirs.into_iter()
+        .map(|d| d.join("cswap.exe"))
+        .find(|p| p.is_file())
 }
 
 /// Runs `cswap switch` (rotate to the next account) in the background, then
@@ -1314,7 +1634,9 @@ fn cswap_switch(exe: &Path) -> Result<(), String> {
             }
             _ => {
                 let _ = child.kill();
-                return Err(format!("cswap didn't finish within {TIMEOUT_SECS} seconds."));
+                return Err(format!(
+                    "cswap didn't finish within {TIMEOUT_SECS} seconds."
+                ));
             }
         }
     };
@@ -1326,15 +1648,23 @@ fn cswap_switch(exe: &Path) -> Result<(), String> {
             return Err(m.to_string());
         }
         if v["switched"] == serde_json::Value::Bool(false) {
-            let reason = v["reason"].as_str().unwrap_or("cswap didn't switch accounts.");
+            let reason = v["reason"]
+                .as_str()
+                .unwrap_or("cswap didn't switch accounts.");
             return Err(reason.to_string());
         }
     }
     if status.success() {
         Ok(())
     } else {
-        let detail = [stderr.trim(), stdout.trim()].into_iter().find(|t| !t.is_empty());
-        Err(detail.unwrap_or("cswap failed.").chars().take(500).collect())
+        let detail = [stderr.trim(), stdout.trim()]
+            .into_iter()
+            .find(|t| !t.is_empty());
+        Err(detail
+            .unwrap_or("cswap failed.")
+            .chars()
+            .take(500)
+            .collect())
     }
 }
 
@@ -1356,7 +1686,10 @@ fn start_provider_fetch() {
             s.codex_sig.clone(),
             now() - s.codex_checked_at >= 60,
             s.token_tracker.clone(),
-            s.accounts.iter().map(|account| account.dir.clone()).collect::<Vec<_>>(),
+            s.accounts
+                .iter()
+                .map(|account| account.dir.clone())
+                .collect::<Vec<_>>(),
             now() - s.tokens_checked_at >= 60,
         )
     });
@@ -1368,17 +1701,52 @@ fn start_provider_fetch() {
         } else if !fake && signature == old_sig && old_codex.is_some() {
             old_codex.unwrap()
         } else if fake {
-            providers::Reading { provider: providers::Provider::Codex, account: None, windows: vec![
-                providers::Window { key:"week".into(),label:"Weekly".into(),percent:37.0,resets_at:Some(t+4*86400),window_secs:Some(604800),reset_since_last_run:false },
-                providers::Window { key:"5h".into(),label:"5-hour".into(),percent:18.0,resets_at:Some(t+7200),window_secs:Some(18000),reset_since_last_run:false }], fetched_at:t, as_of:t, error:None, plan_type:Some("dev".into()) }
+            providers::Reading {
+                provider: providers::Provider::Codex,
+                account: None,
+                windows: vec![
+                    providers::Window {
+                        key: "week".into(),
+                        label: "Weekly".into(),
+                        percent: 37.0,
+                        resets_at: Some(t + 4 * 86400),
+                        window_secs: Some(604800),
+                        reset_since_last_run: false,
+                    },
+                    providers::Window {
+                        key: "5h".into(),
+                        label: "5-hour".into(),
+                        percent: 18.0,
+                        resets_at: Some(t + 7200),
+                        window_secs: Some(18000),
+                        reset_since_last_run: false,
+                    },
+                ],
+                fetched_at: t,
+                as_of: t,
+                error: None,
+                plan_type: Some("dev".into()),
+            }
         } else {
             providers::read_codex(t)
         };
-        let spark = if host.is_empty() { None } else if fake {
-            Some(providers::parse_spark(&serde_json::json!({"endpoints":[{"name":"dev","model":"local","engine":"dev","up":true,"tok_s":142.0,"running":1}],"sys":{"gpu":{"util":72.0}}}),t))
-        } else { Some(providers::fetch_spark(&host,t)) };
+        let spark = if host.is_empty() {
+            None
+        } else if fake {
+            Some(providers::parse_spark(
+                &serde_json::json!({"endpoints":[{"name":"dev","model":"local","engine":"dev","up":true,"tok_s":142.0,"running":1}],"sys":{"gpu":{"util":72.0}}}),
+                t,
+            ))
+        } else {
+            Some(providers::fetch_spark(&host, t))
+        };
         let tokens = tokens_due
-            .then(|| tracker.lock().ok().map(|mut tracker| tracker.poll(&dirs, t)))
+            .then(|| {
+                tracker
+                    .lock()
+                    .ok()
+                    .map(|mut tracker| tracker.poll(&dirs, t))
+            })
             .flatten();
         let msg = Box::new(ProviderResult {
             codex,
@@ -1387,25 +1755,72 @@ fn start_provider_fetch() {
             spark,
             tokens,
         });
-        unsafe { PostMessageW(ctl as HWND,WM_APP_PROVIDER,0,Box::into_raw(msg) as LPARAM); }
+        unsafe {
+            PostMessageW(
+                ctl as HWND,
+                WM_APP_PROVIDER,
+                0,
+                Box::into_raw(msg) as LPARAM,
+            );
+        }
     });
 }
 
-fn claude_readings(s:&State,t:i64)->Vec<providers::Reading>{
-    s.accounts.iter().map(|a|{
-        let mut windows=Vec::new();
-        if let Some(u)=&a.usage {
-            if let Some(l)=u.five_hour { windows.push(providers::Window{key:"5h".into(),label:"5-hour".into(),percent:l.percent,resets_at:l.resets_at,window_secs:Some(18000),reset_since_last_run:false}); }
-            if let Some(l)=u.weekly { windows.push(providers::Window{key:"week".into(),label:"Weekly".into(),percent:l.percent,resets_at:l.resets_at,window_secs:Some(604800),reset_since_last_run:false}); }
-            for e in &u.extra { windows.push(providers::Window{key:e.key.clone(),label:e.label.clone(),percent:e.limit.percent,resets_at:e.limit.resets_at,window_secs:Some(e.window_secs),reset_since_last_run:false}); }
-        }
-        providers::Reading{provider:providers::Provider::Claude,account:Some(a.label.clone()),windows,fetched_at:a.last_ok.unwrap_or(t),as_of:a.last_ok.unwrap_or(t),error:a.error.clone(),plan_type:None}
-    }).collect()
+fn claude_readings(s: &State, t: i64) -> Vec<providers::Reading> {
+    s.accounts
+        .iter()
+        .map(|a| {
+            let mut windows = Vec::new();
+            if let Some(u) = &a.usage {
+                if let Some(l) = u.five_hour {
+                    windows.push(providers::Window {
+                        key: "5h".into(),
+                        label: "5-hour".into(),
+                        percent: l.percent,
+                        resets_at: l.resets_at,
+                        window_secs: Some(18000),
+                        reset_since_last_run: false,
+                    });
+                }
+                if let Some(l) = u.weekly {
+                    windows.push(providers::Window {
+                        key: "week".into(),
+                        label: "Weekly".into(),
+                        percent: l.percent,
+                        resets_at: l.resets_at,
+                        window_secs: Some(604800),
+                        reset_since_last_run: false,
+                    });
+                }
+                for e in &u.extra {
+                    windows.push(providers::Window {
+                        key: e.key.clone(),
+                        label: e.label.clone(),
+                        percent: e.limit.percent,
+                        resets_at: e.limit.resets_at,
+                        window_secs: Some(e.window_secs),
+                        reset_since_last_run: false,
+                    });
+                }
+            }
+            providers::Reading {
+                provider: providers::Provider::Claude,
+                account: Some(a.label.clone()),
+                windows,
+                fetched_at: a.last_ok.unwrap_or(t),
+                as_of: a.last_ok.unwrap_or(t),
+                error: a.error.clone(),
+                plan_type: None,
+            }
+        })
+        .collect()
 }
 
-fn persist_state(s:&mut State,t:i64){
-    let mut readings=claude_readings(s,t);
-    if let Some(c)=&s.codex { readings.push(c.clone()); }
+fn persist_state(s: &mut State, t: i64) {
+    let mut readings = claude_readings(s, t);
+    if let Some(c) = &s.codex {
+        readings.push(c.clone());
+    }
     if let Some(history) = &mut s.history {
         let _ = history.append(&readings, s.spark.as_ref(), t);
         let _ = storage::write_state(
@@ -1413,22 +1828,40 @@ fn persist_state(s:&mut State,t:i64){
             s.spark.as_ref(),
             history,
             t,
-            (s.token_totals.claude, s.token_totals.claude_output, s.token_totals.codex),
+            (
+                s.token_totals.claude,
+                s.token_totals.claude_output,
+                s.token_totals.codex,
+            ),
             s.tokens_checked_at,
         );
     }
 }
 
-fn on_provider_result(r:ProviderResult){
-    let spark_notice = with(|s|{
-        s.codex=Some(r.codex); s.codex_sig=r.codex_sig; if r.codex_checked{s.codex_checked_at=now();} s.spark=r.spark;
-        if let Some(tokens) = r.tokens { s.token_totals = tokens; s.tokens_checked_at = now(); }
-        if let Some(sp)=&s.spark { s.spark_history.push((sp.fetched_at,sp.tok_s,sp.gpu_util)); }
-        let cutoff=now()-600; s.spark_history.retain(|x|x.0>=cutoff);
-        persist_state(s,now()); s.rendered=None;
+fn on_provider_result(r: ProviderResult) {
+    let spark_notice = with(|s| {
+        s.codex = Some(r.codex);
+        s.codex_sig = r.codex_sig;
+        if r.codex_checked {
+            s.codex_checked_at = now();
+        }
+        s.spark = r.spark;
+        if let Some(tokens) = r.tokens {
+            s.token_totals = tokens;
+            s.tokens_checked_at = now();
+        }
+        if let Some(sp) = &s.spark {
+            s.spark_history.push((sp.fetched_at, sp.tok_s, sp.gpu_util));
+        }
+        let cutoff = now() - 600;
+        s.spark_history.retain(|x| x.0 >= cutoff);
+        persist_state(s, now());
+        s.rendered = None;
         spark_alert(s)
     });
-    if let Some(notice) = spark_notice { show_alert(&notice); }
+    if let Some(notice) = spark_notice {
+        show_alert(&notice);
+    }
     unsafe {
         let (ctl, busy) = with(|s| (s.ctl, s.spark.as_ref().is_some_and(|spark| spark.busy)));
         if busy {
@@ -1437,7 +1870,8 @@ fn on_provider_result(r:ProviderResult){
             KillTimer(ctl, T_SPARK_PULSE);
         }
     }
-    ensure_widget(); update_tooltip();
+    ensure_widget();
+    update_tooltip();
 }
 
 fn spark_pulse_alpha() -> f32 {
@@ -1449,7 +1883,11 @@ fn spark_pulse_alpha() -> f32 {
 }
 
 fn provider_poll_ms() -> u32 {
-    if session_inactive() { 30_000 } else { 5_000 }
+    if session_inactive() {
+        30_000
+    } else {
+        5_000
+    }
 }
 
 fn session_inactive() -> bool {
@@ -1465,10 +1903,13 @@ fn session_inactive() -> bool {
             windows_sys::Win32::System::StationsAndDesktops::CloseDesktop(desktop);
         }
         let mut input = windows_sys::Win32::UI::Input::KeyboardAndMouse::LASTINPUTINFO {
-            cbSize: std::mem::size_of::<windows_sys::Win32::UI::Input::KeyboardAndMouse::LASTINPUTINFO>() as u32,
+            cbSize: std::mem::size_of::<
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::LASTINPUTINFO,
+            >() as u32,
             dwTime: 0,
         };
-        let idle = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetLastInputInfo(&mut input) != 0
+        let idle = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetLastInputInfo(&mut input)
+            != 0
             && windows_sys::Win32::System::SystemInformation::GetTickCount()
                 .wrapping_sub(input.dwTime)
                 >= 10 * 60 * 1000;
@@ -1482,7 +1923,10 @@ fn evaluate_alerts(s: &mut State) -> Vec<String> {
     }
     let t = now();
     let mut notices = Vec::new();
-    for reading in claude_readings(s, t).into_iter().chain(s.codex.iter().cloned()) {
+    for reading in claude_readings(s, t)
+        .into_iter()
+        .chain(s.codex.iter().cloned())
+    {
         let provider = match reading.provider {
             providers::Provider::Claude => "Claude",
             providers::Provider::Codex => "Codex",
@@ -1499,7 +1943,10 @@ fn evaluate_alerts(s: &mut State) -> Vec<String> {
                 None,
             );
             let high = window.percent >= 90.0
-                && pace.full_at.zip(window.resets_at).is_some_and(|(full, end)| full < end);
+                && pace
+                    .full_at
+                    .zip(window.resets_at)
+                    .is_some_and(|(full, end)| full < end);
             let previous = s.high_windows.insert(key.clone(), (reset, high));
             if high && s.alerted_periods.get(&key).copied() != Some(reset) {
                 notices.push(format!(
@@ -1520,7 +1967,10 @@ fn spark_alert(s: &mut State) -> Option<String> {
     if !s.alerts {
         return None;
     }
-    let up = s.spark.as_ref().is_some_and(|spark| spark.up && spark.error.is_none());
+    let up = s
+        .spark
+        .as_ref()
+        .is_some_and(|spark| spark.up && spark.error.is_none());
     let old = s.spark_was_up.replace(up);
     match (old, up) {
         (Some(true), false) => Some("Spark is unreachable.".into()),
@@ -1574,9 +2024,14 @@ fn on_cswap_done(r: Result<(), String>) {
         // The live login changed: show the new account's numbers now.
         Ok(()) => start_fetch_all(),
         Err(e) => unsafe {
-            message(&format!("Switching accounts with claude-swap failed:
+            message(
+                &format!(
+                    "Switching accounts with claude-swap failed:
 
-{e}"), MB_OK | MB_ICONWARNING);
+{e}"
+                ),
+                MB_OK | MB_ICONWARNING,
+            );
         },
     }
 }
@@ -1587,33 +2042,142 @@ fn open_usage_page() {
 
 fn open_url(url: &str) {
     unsafe {
-        ShellExecuteW(null_mut(), w!("open"), wide(url).as_ptr(), null(), null(), SW_SHOWNORMAL);
+        ShellExecuteW(
+            null_mut(),
+            w!("open"),
+            wide(url).as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        );
     }
 }
 
 thread_local! { static SPARK_DIALOG: RefCell<(String,Option<String>)> = const { RefCell::new((String::new(),None)) }; }
 
-unsafe extern "system" fn spark_dialog_proc(hwnd:HWND,msg:u32,wp:WPARAM,_:LPARAM)->isize{
+unsafe extern "system" fn spark_dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, _: LPARAM) -> isize {
     match msg {
-        WM_INITDIALOG=>{let text=SPARK_DIALOG.with(|x|x.borrow().0.clone());SetDlgItemTextW(hwnd,100,wide(&text).as_ptr());1}
-        WM_COMMAND if (wp&0xffff)as usize==IDOK as usize=>{let mut b=[0u16;512];let n=GetDlgItemTextW(hwnd,100,b.as_mut_ptr(),b.len()as i32);let s=String::from_utf16_lossy(&b[..n as usize]).trim().trim_start_matches("http://").trim_end_matches('/').to_string();SPARK_DIALOG.with(|x|x.borrow_mut().1=Some(s));EndDialog(hwnd,IDOK as isize);1}
-        WM_COMMAND if (wp&0xffff)as usize==IDCANCEL as usize=>{EndDialog(hwnd,IDCANCEL as isize);1}
-        WM_CLOSE=>{EndDialog(hwnd,IDCANCEL as isize);1}
-        _=>0
+        WM_INITDIALOG => {
+            let text = SPARK_DIALOG.with(|x| x.borrow().0.clone());
+            SetDlgItemTextW(hwnd, 100, wide(&text).as_ptr());
+            1
+        }
+        WM_COMMAND if (wp & 0xffff) as usize == IDOK as usize => {
+            let mut b = [0u16; 512];
+            let n = GetDlgItemTextW(hwnd, 100, b.as_mut_ptr(), b.len() as i32);
+            let s = String::from_utf16_lossy(&b[..n as usize])
+                .trim()
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_string();
+            SPARK_DIALOG.with(|x| x.borrow_mut().1 = Some(s));
+            EndDialog(hwnd, IDOK as isize);
+            1
+        }
+        WM_COMMAND if (wp & 0xffff) as usize == IDCANCEL as usize => {
+            EndDialog(hwnd, IDCANCEL as isize);
+            1
+        }
+        WM_CLOSE => {
+            EndDialog(hwnd, IDCANCEL as isize);
+            1
+        }
+        _ => 0,
     }
 }
 
-fn prompt_spark_address()->Option<String>{
-    let current=with(|s|s.spark_host.clone()); SPARK_DIALOG.with(|x|*x.borrow_mut()=(current,None));
-    let mut v=Vec::<u16>::new(); let d=|v:&mut Vec<u16>,x:u32|{v.push(x as u16);v.push((x>>16)as u16)}; let z=|v:&mut Vec<u16>,s:&str|{v.extend(s.encode_utf16());v.push(0)};
-    d(&mut v,(WS_POPUP|WS_CAPTION|WS_SYSMENU)as u32|DS_MODALFRAME as u32);d(&mut v,0);v.extend([4,10,10,210,70]);v.extend([0,0]);z(&mut v,"Spark address");
-    let item=|v:&mut Vec<u16>,style:u32,x:u16,y:u16,cx:u16,cy:u16,id:u16,class:u16,title:&str|{if v.len()%2!=0{v.push(0)}d(v,style);d(v,0);v.extend([x,y,cx,cy,id,0xffff,class]);z(v,title);v.push(0)};
-    item(&mut v,(WS_CHILD|WS_VISIBLE)as u32,8,8,194,10,101,0x0082,"Host or host:port");
-    item(&mut v,(WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP)as u32|ES_AUTOHSCROLL as u32,8,21,194,14,100,0x0081,"");
-    item(&mut v,(WS_CHILD|WS_VISIBLE|WS_TABSTOP)as u32|BS_DEFPUSHBUTTON as u32,92,45,52,14,IDOK as u16,0x0080,"OK");
-    item(&mut v,(WS_CHILD|WS_VISIBLE|WS_TABSTOP)as u32,150,45,52,14,IDCANCEL as u16,0x0080,"Cancel");
-    unsafe{DialogBoxIndirectParamW(GetModuleHandleW(null()),v.as_ptr()as*const DLGTEMPLATE,with(|s|s.ctl),Some(spark_dialog_proc),0);}
-    SPARK_DIALOG.with(|x|x.borrow_mut().1.take())
+fn prompt_spark_address() -> Option<String> {
+    let current = with(|s| s.spark_host.clone());
+    SPARK_DIALOG.with(|x| *x.borrow_mut() = (current, None));
+    let mut v = Vec::<u16>::new();
+    let d = |v: &mut Vec<u16>, x: u32| {
+        v.push(x as u16);
+        v.push((x >> 16) as u16)
+    };
+    let z = |v: &mut Vec<u16>, s: &str| {
+        v.extend(s.encode_utf16());
+        v.push(0)
+    };
+    d(
+        &mut v,
+        (WS_POPUP | WS_CAPTION | WS_SYSMENU) as u32 | DS_MODALFRAME as u32,
+    );
+    d(&mut v, 0);
+    v.extend([4, 10, 10, 210, 70]);
+    v.extend([0, 0]);
+    z(&mut v, "Spark address");
+    let item = |v: &mut Vec<u16>,
+                style: u32,
+                x: u16,
+                y: u16,
+                cx: u16,
+                cy: u16,
+                id: u16,
+                class: u16,
+                title: &str| {
+        if v.len() % 2 != 0 {
+            v.push(0)
+        }
+        d(v, style);
+        d(v, 0);
+        v.extend([x, y, cx, cy, id, 0xffff, class]);
+        z(v, title);
+        v.push(0)
+    };
+    item(
+        &mut v,
+        (WS_CHILD | WS_VISIBLE) as u32,
+        8,
+        8,
+        194,
+        10,
+        101,
+        0x0082,
+        "Host or host:port",
+    );
+    item(
+        &mut v,
+        (WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP) as u32 | ES_AUTOHSCROLL as u32,
+        8,
+        21,
+        194,
+        14,
+        100,
+        0x0081,
+        "",
+    );
+    item(
+        &mut v,
+        (WS_CHILD | WS_VISIBLE | WS_TABSTOP) as u32 | BS_DEFPUSHBUTTON as u32,
+        92,
+        45,
+        52,
+        14,
+        IDOK as u16,
+        0x0080,
+        "OK",
+    );
+    item(
+        &mut v,
+        (WS_CHILD | WS_VISIBLE | WS_TABSTOP) as u32,
+        150,
+        45,
+        52,
+        14,
+        IDCANCEL as u16,
+        0x0080,
+        "Cancel",
+    );
+    unsafe {
+        DialogBoxIndirectParamW(
+            GetModuleHandleW(null()),
+            v.as_ptr() as *const DLGTEMPLATE,
+            with(|s| s.ctl),
+            Some(spark_dialog_proc),
+            0,
+        );
+    }
+    SPARK_DIALOG.with(|x| x.borrow_mut().1.take())
 }
 
 /// A small yellow dot next to the item (a native menu can show an icon but not a coloured label).
@@ -1643,7 +2207,11 @@ unsafe fn make_dot(opacity: f32) -> HBITMAP {
     let bi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: N, biHeight: -N, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB,
+            biWidth: N,
+            biHeight: -N,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
             ..std::mem::zeroed()
         },
         ..std::mem::zeroed()
@@ -1656,8 +2224,12 @@ unsafe fn make_dot(opacity: f32) -> HBITMAP {
     let px = std::slice::from_raw_parts_mut(bits as *mut u32, (N * N) as usize);
     for y in 0..N {
         for x in 0..N {
-            let (dx, dy) = (x as f32 + 0.5 - N as f32 / 2.0, y as f32 + 0.5 - N as f32 / 2.0);
-            let a = (N as f32 / 2.0 - 2.0 - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0) * opacity;
+            let (dx, dy) = (
+                x as f32 + 0.5 - N as f32 / 2.0,
+                y as f32 + 0.5 - N as f32 / 2.0,
+            );
+            let a =
+                (N as f32 / 2.0 - 2.0 - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0) * opacity;
             // Premultiplied ARGB: yellow (255, 200, 0).
             let c = |v: f32| (v * a) as u32;
             px[(y * N + x) as usize] = (c(255.0) << 24) | (c(255.0) << 16) | (c(200.0) << 8);
@@ -1672,10 +2244,18 @@ unsafe fn show_menu_tip(menu: HMENU, text: &str) {
     let mut tip = with(|s| s.menu_tip);
     if tip.is_null() {
         tip = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW, TOOLTIPS_CLASSW, null(),
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            TOOLTIPS_CLASSW,
+            null(),
             WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-            ctl, null_mut(), GetModuleHandleW(null()), null(),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            ctl,
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
         );
         with(|s| s.menu_tip = tip);
     }
@@ -1700,8 +2280,17 @@ unsafe fn show_menu_tip(menu: HMENU, text: &str) {
     }
     let size = SendMessageW(tip, TTM_GETBUBBLESIZE, 0, tool) as u32;
     let width = (size & 0xFFFF) as i32;
-    let x = if item.right + 4 + width <= GetSystemMetrics(SM_CXSCREEN) { item.right + 4 } else { item.left - 4 - width };
-    SendMessageW(tip, TTM_TRACKPOSITION, 0, ((item.top as u32 & 0xFFFF) << 16 | (x as u32 & 0xFFFF)) as LPARAM);
+    let x = if item.right + 4 + width <= GetSystemMetrics(SM_CXSCREEN) {
+        item.right + 4
+    } else {
+        item.left - 4 - width
+    };
+    SendMessageW(
+        tip,
+        TTM_TRACKPOSITION,
+        0,
+        ((item.top as u32 & 0xFFFF) << 16 | (x as u32 & 0xFFFF)) as LPARAM,
+    );
     SendMessageW(tip, TTM_TRACKACTIVATE, 1, tool);
 }
 
@@ -1723,88 +2312,205 @@ unsafe fn show_menu() {
     let menu = CreatePopupMenu();
     // Settings first, then the everyday actions next to Exit, closest to the
     // taskbar where the menu opens.
-    let tick = |id: usize| if setting_checked(id) == Some(true) { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let tick = |id: usize| {
+        if setting_checked(id) == Some(true) {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        }
+    };
     let sub = CreatePopupMenu();
     for (i, (_, label)) in INTERVALS.iter().enumerate() {
-        AppendMenuW(sub, tick(ID_INTERVAL_BASE + i), ID_INTERVAL_BASE + i, wide(label).as_ptr());
+        AppendMenuW(
+            sub,
+            tick(ID_INTERVAL_BASE + i),
+            ID_INTERVAL_BASE + i,
+            wide(label).as_ptr(),
+        );
     }
-    AppendMenuW(menu, tick(ID_SHOW_CLAUDE), ID_SHOW_CLAUDE, w!("Show Claude"));
+    AppendMenuW(
+        menu,
+        tick(ID_SHOW_CLAUDE),
+        ID_SHOW_CLAUDE,
+        w!("Show Claude"),
+    );
     AppendMenuW(menu, tick(ID_SHOW_CODEX), ID_SHOW_CODEX, w!("Show Codex"));
     AppendMenuW(menu, tick(ID_SHOW_SPARK), ID_SHOW_SPARK, w!("Show Spark"));
     AppendMenuW(menu, tick(ID_ALERTS), ID_ALERTS, w!("Alerts"));
     AppendMenuW(menu, MF_STRING, ID_SPARK_ADDRESS, w!("Spark address..."));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_POPUP, sub as usize, w!("Update every"));
-    AppendMenuW(menu, tick(ID_SHOW_LEFT), ID_SHOW_LEFT, w!("Show remaining instead of used"));
+    AppendMenuW(
+        menu,
+        tick(ID_SHOW_LEFT),
+        ID_SHOW_LEFT,
+        w!("Show remaining instead of used"),
+    );
     let custom = CreatePopupMenu();
     let fonts = CreatePopupMenu();
     for (i, (_, label)) in FONT_SIZES.iter().enumerate() {
-        AppendMenuW(fonts, tick(ID_FONT_BASE + i), ID_FONT_BASE + i, wide(label).as_ptr());
+        AppendMenuW(
+            fonts,
+            tick(ID_FONT_BASE + i),
+            ID_FONT_BASE + i,
+            wide(label).as_ptr(),
+        );
     }
     AppendMenuW(custom, MF_POPUP, fonts as usize, w!("Font size"));
     let icon = CreatePopupMenu();
     AppendMenuW(icon, tick(ID_HIDE_ICON), ID_HIDE_ICON, w!("Hide icon"));
-    AppendMenuW(icon, tick(ID_CLAUDE_ICON), ID_CLAUDE_ICON, w!("Show Claude icon"));
-    AppendMenuW(icon, tick(ID_PIXEL_ICON), ID_PIXEL_ICON, w!("Show pixel Claude icon"));
+    AppendMenuW(
+        icon,
+        tick(ID_CLAUDE_ICON),
+        ID_CLAUDE_ICON,
+        w!("Show Claude icon"),
+    );
+    AppendMenuW(
+        icon,
+        tick(ID_PIXEL_ICON),
+        ID_PIXEL_ICON,
+        w!("Show pixel Claude icon"),
+    );
     AppendMenuW(icon, MF_SEPARATOR, 0, null());
     let sizes = CreatePopupMenu();
     for (i, (_, label)) in ICON_SIZES.iter().enumerate() {
-        AppendMenuW(sizes, tick(ID_ICON_SIZE_BASE + i), ID_ICON_SIZE_BASE + i, wide(label).as_ptr());
+        AppendMenuW(
+            sizes,
+            tick(ID_ICON_SIZE_BASE + i),
+            ID_ICON_SIZE_BASE + i,
+            wide(label).as_ptr(),
+        );
     }
     AppendMenuW(icon, MF_POPUP, sizes as usize, w!("Icon size"));
     AppendMenuW(custom, MF_POPUP, icon as usize, w!("Icon"));
     let rings = CreatePopupMenu();
     AppendMenuW(rings, tick(ID_RINGS), ID_RINGS, w!("Show usage rings"));
     AppendMenuW(rings, MF_SEPARATOR, 0, null());
-    AppendMenuW(rings, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
-    AppendMenuW(rings, tick(ID_RING_COLOR_ONLY), ID_RING_COLOR_ONLY, w!("Warning colors on the rings only"));
-    AppendMenuW(rings, tick(ID_RING_SPACE), ID_RING_SPACE, w!("Space around the rings (small taskbars)"));
+    AppendMenuW(
+        rings,
+        tick(ID_RING_TEXT),
+        ID_RING_TEXT,
+        w!("Numbers inside the rings"),
+    );
+    AppendMenuW(
+        rings,
+        tick(ID_RING_COLOR_ONLY),
+        ID_RING_COLOR_ONLY,
+        w!("Warning colors on the rings only"),
+    );
+    AppendMenuW(
+        rings,
+        tick(ID_RING_SPACE),
+        ID_RING_SPACE,
+        w!("Space around the rings (small taskbars)"),
+    );
     let margins = CreatePopupMenu();
     for (i, px) in RING_MARGINS.iter().enumerate() {
         let text = wide(&format!("{px} px"));
-        AppendMenuW(margins, tick(ID_RING_MARGIN_BASE + i), ID_RING_MARGIN_BASE + i, text.as_ptr());
+        AppendMenuW(
+            margins,
+            tick(ID_RING_MARGIN_BASE + i),
+            ID_RING_MARGIN_BASE + i,
+            text.as_ptr(),
+        );
     }
     AppendMenuW(rings, MF_POPUP, margins as usize, w!("Number margin"));
     AppendMenuW(custom, MF_POPUP, rings as usize, w!("Usage rings"));
-    AppendMenuW(custom, tick(ID_ROLL), ID_ROLL, w!("Roll numbers when they change"));
-    AppendMenuW(custom, tick(ID_HIDE_LABELS), ID_HIDE_LABELS, w!("Hide labels"));
-    AppendMenuW(custom, tick(ID_HIDE_PERCENT), ID_HIDE_PERCENT, w!("Hide % symbol"));
+    AppendMenuW(
+        custom,
+        tick(ID_ROLL),
+        ID_ROLL,
+        w!("Roll numbers when they change"),
+    );
+    AppendMenuW(
+        custom,
+        tick(ID_HIDE_LABELS),
+        ID_HIDE_LABELS,
+        w!("Hide labels"),
+    );
+    AppendMenuW(
+        custom,
+        tick(ID_HIDE_PERCENT),
+        ID_HIDE_PERCENT,
+        w!("Hide % symbol"),
+    );
     let limits = CreatePopupMenu();
     AppendMenuW(limits, tick(ID_HIDE_FIVE), ID_HIDE_FIVE, w!("5-hour"));
     AppendMenuW(limits, tick(ID_HIDE_WEEK), ID_HIDE_WEEK, w!("Weekly"));
-    AppendMenuW(limits, tick(ID_HIDE_FABLE), ID_HIDE_FABLE, w!("Fable (weekly)"));
+    AppendMenuW(
+        limits,
+        tick(ID_HIDE_FABLE),
+        ID_HIDE_FABLE,
+        w!("Fable (weekly)"),
+    );
     AppendMenuW(custom, MF_POPUP, limits as usize, w!("Show/hide limits"));
     // On a vertical taskbar the same setting moves the widget to the top.
     let vertical = with(|s| s.rendered.as_ref().is_some_and(|k| k.vertical));
-    let side = if vertical { w!("Show on the top side") } else { w!("Show on the left side") };
+    let side = if vertical {
+        w!("Show on the top side")
+    } else {
+        w!("Show on the left side")
+    };
     AppendMenuW(custom, tick(ID_ON_LEFT), ID_ON_LEFT, side);
     // Only matters with more than one account.
     let n_accounts = with(|s| s.accounts.len());
     let per = CreatePopupMenu();
     for n in 1..=render::MAX_ROWS_PER_COLUMN {
         let text = wide(&n.to_string());
-        AppendMenuW(per, tick(ID_PER_COL_BASE + n), ID_PER_COL_BASE + n, text.as_ptr());
+        AppendMenuW(
+            per,
+            tick(ID_PER_COL_BASE + n),
+            ID_PER_COL_BASE + n,
+            text.as_ptr(),
+        );
     }
-    let per_flags = if n_accounts > 1 { MF_POPUP } else { MF_POPUP | MF_GRAYED };
+    let per_flags = if n_accounts > 1 {
+        MF_POPUP
+    } else {
+        MF_POPUP | MF_GRAYED
+    };
     AppendMenuW(custom, per_flags, per as usize, w!("Accounts per column"));
     AppendMenuW(menu, MF_POPUP, custom as usize, w!("Customize"));
     let accounts = CreatePopupMenu();
     AppendMenuW(accounts, MF_STRING, ID_ADD_ACCOUNT, w!("Add account…"));
-    let labels = with(|s| s.accounts.iter().map(|a| a.label.clone()).collect::<Vec<_>>());
+    let labels = with(|s| {
+        s.accounts
+            .iter()
+            .map(|a| a.label.clone())
+            .collect::<Vec<_>>()
+    });
     if !labels.is_empty() {
         AppendMenuW(accounts, MF_SEPARATOR, 0, null());
     }
     // Keep at least one account.
-    let removable = if labels.len() > 1 { MF_STRING } else { MF_STRING | MF_GRAYED };
+    let removable = if labels.len() > 1 {
+        MF_STRING
+    } else {
+        MF_STRING | MF_GRAYED
+    };
     for (i, label) in labels.iter().enumerate() {
         let text = wide(&format!("Remove {}", label.replace('&', "&&")));
         AppendMenuW(accounts, removable, ID_REMOVE_BASE + i, text.as_ptr());
     }
     AppendMenuW(menu, MF_POPUP, accounts as usize, w!("Accounts"));
-    AppendMenuW(menu, tick(ID_AUTOSTART), ID_AUTOSTART, w!("Start with Windows"));
+    AppendMenuW(
+        menu,
+        tick(ID_AUTOSTART),
+        ID_AUTOSTART,
+        w!("Start with Windows"),
+    );
     if DEV {
-        AppendMenuW(menu, tick(ID_FAKE_DATA), ID_FAKE_DATA, w!("Use fake data (dev only)"));
-        set_menu_dot(menu, ID_FAKE_DATA, setting_checked(ID_FAKE_DATA) == Some(true));
+        AppendMenuW(
+            menu,
+            tick(ID_FAKE_DATA),
+            ID_FAKE_DATA,
+            w!("Use fake data (dev only)"),
+        );
+        set_menu_dot(
+            menu,
+            ID_FAKE_DATA,
+            setting_checked(ID_FAKE_DATA) == Some(true),
+        );
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_REFRESH, w!("Refresh now"));
@@ -1827,9 +2533,21 @@ unsafe fn show_menu() {
     SetForegroundWindow(ctl);
     // Settings apply in place and leave the menu open; see `menu_filter`.
     MENU.set(menu);
-    let hook = SetWindowsHookExW(WH_MSGFILTER, Some(menu_filter), null_mut(), GetCurrentThreadId());
-    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-        pt.x, pt.y, 0, ctl, null());
+    let hook = SetWindowsHookExW(
+        WH_MSGFILTER,
+        Some(menu_filter),
+        null_mut(),
+        GetCurrentThreadId(),
+    );
+    let cmd = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+        pt.x,
+        pt.y,
+        0,
+        ctl,
+        null(),
+    );
     UnhookWindowsHookEx(hook);
     MENU.set(null_mut());
     PostMessageW(ctl, WM_NULL, 0, 0);
@@ -1839,9 +2557,19 @@ unsafe fn show_menu() {
         return;
     }
     match cmd as usize {
-        ID_REFRESH => { start_fetch_all(); start_provider_fetch(); },
+        ID_REFRESH => {
+            start_fetch_all();
+            start_provider_fetch();
+        }
         ID_SPARK_ADDRESS => {
-            if let Some(host)=prompt_spark_address(){ with(|s|{s.spark_host=host.clone();s.rendered=None;}); write_string_setting("SparkHost",&host); start_provider_fetch(); }
+            if let Some(host) = prompt_spark_address() {
+                with(|s| {
+                    s.spark_host = host.clone();
+                    s.rendered = None;
+                });
+                write_string_setting("SparkHost", &host);
+                start_provider_fetch();
+            }
         }
         ID_ADD_ACCOUNT => add_account(),
         id if (ID_REMOVE_BASE..ID_REMOVE_BASE + labels.len()).contains(&id) => {
@@ -1891,7 +2619,9 @@ fn setting_checked(id: usize) -> Option<bool> {
             ID_HIDE_ICON => s.hide_icon,
             ID_CLAUDE_ICON => !s.hide_icon && !s.pixel_icon,
             ID_PIXEL_ICON => !s.hide_icon && s.pixel_icon,
-            id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN).contains(&id) => {
+            id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN)
+                .contains(&id) =>
+            {
                 s.rows_per_col as usize == id - ID_PER_COL_BASE
             }
             id if (ID_RING_MARGIN_BASE..ID_RING_MARGIN_BASE + RING_MARGINS.len()).contains(&id) => {
@@ -1915,11 +2645,28 @@ fn setting_checked(id: usize) -> Option<bool> {
 fn apply_setting(id: usize) -> bool {
     match id {
         ID_SHOW_CLAUDE | ID_SHOW_CODEX | ID_SHOW_SPARK => {
-            let (name,on)=with(|s|match id {ID_SHOW_CLAUDE=>{s.show_claude=!s.show_claude;("ShowClaude",s.show_claude)},ID_SHOW_CODEX=>{s.show_codex=!s.show_codex;("ShowCodex",s.show_codex)},_=>{s.show_spark=!s.show_spark;("ShowSpark",s.show_spark)}});
-            write_setting(name,on as u32); ensure_widget();
+            let (name, on) = with(|s| match id {
+                ID_SHOW_CLAUDE => {
+                    s.show_claude = !s.show_claude;
+                    ("ShowClaude", s.show_claude)
+                }
+                ID_SHOW_CODEX => {
+                    s.show_codex = !s.show_codex;
+                    ("ShowCodex", s.show_codex)
+                }
+                _ => {
+                    s.show_spark = !s.show_spark;
+                    ("ShowSpark", s.show_spark)
+                }
+            });
+            write_setting(name, on as u32);
+            ensure_widget();
         }
         ID_ALERTS => {
-            let enabled = with(|s| { s.alerts = !s.alerts; s.alerts });
+            let enabled = with(|s| {
+                s.alerts = !s.alerts;
+                s.alerts
+            });
             write_setting("Alerts", enabled as u32);
         }
         ID_AUTOSTART => set_autostart(!autostart_enabled()),
@@ -2042,7 +2789,9 @@ fn apply_setting(id: usize) -> bool {
             }
             ensure_widget();
         }
-        id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN).contains(&id) => {
+        id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN)
+            .contains(&id) =>
+        {
             let n = (id - ID_PER_COL_BASE) as u32;
             with(|s| s.rows_per_col = n);
             write_setting("AccountsPerColumn", n);
@@ -2085,19 +2834,31 @@ unsafe fn refresh_menu(menu: HMENU) {
         }
         let id = GetMenuItemID(menu, i) as usize;
         if let Some(on) = setting_checked(id) {
-            CheckMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_CHECKED } else { MF_UNCHECKED });
+            CheckMenuItem(
+                menu,
+                i as u32,
+                MF_BYPOSITION | if on { MF_CHECKED } else { MF_UNCHECKED },
+            );
             if id == ID_FAKE_DATA {
                 set_menu_dot(menu, id, on);
             }
         }
         if (ID_RING_MARGIN_BASE..ID_RING_MARGIN_BASE + RING_MARGINS.len()).contains(&id) {
             let on = with(|s| s.rings && s.ring_text);
-            EnableMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_ENABLED } else { MF_GRAYED });
+            EnableMenuItem(
+                menu,
+                i as u32,
+                MF_BYPOSITION | if on { MF_ENABLED } else { MF_GRAYED },
+            );
         }
         if id == ID_RING_TEXT || id == ID_RING_COLOR_ONLY || id == ID_RING_SPACE {
             // Space around the rings only applies with the numbers inside them.
             let on = with(|s| s.rings && (id != ID_RING_SPACE || s.ring_text));
-            EnableMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_ENABLED } else { MF_GRAYED });
+            EnableMenuItem(
+                menu,
+                i as u32,
+                MF_BYPOSITION | if on { MF_ENABLED } else { MF_GRAYED },
+            );
         }
     }
 }
@@ -2116,8 +2877,13 @@ unsafe extern "system" fn menu_filter(code: i32, wp: WPARAM, lp: LPARAM) -> LRES
         if String::from_utf16_lossy(&class[..n]) == "#32768" {
             let menu = SendMessageW(hwnd, MN_GETHMENU, 0, 0) as HMENU;
             let i = MenuItemFromPoint(null_mut(), menu, m.pt);
-            let usable = i >= 0 && GetMenuState(menu, i as u32, MF_BYPOSITION) & (MF_GRAYED | MF_DISABLED) == 0;
-            let id = if usable { GetMenuItemID(menu, i) as usize } else { 0 };
+            let usable = i >= 0
+                && GetMenuState(menu, i as u32, MF_BYPOSITION) & (MF_GRAYED | MF_DISABLED) == 0;
+            let id = if usable {
+                GetMenuItemID(menu, i) as usize
+            } else {
+                0
+            };
             if dbl && setting_checked(id).is_some() {
                 // A quick second click arrives as a double-click, which the menu
                 // takes as a choice and closes; its button-up toggles again.
@@ -2149,7 +2915,10 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 T_ROLL => {
                     let rolling = with(|s| {
                         for a in &mut s.accounts {
-                            a.prev = a.prev.take().filter(|(_, at)| at.elapsed().as_secs_f32() < ROLL_SECS);
+                            a.prev = a
+                                .prev
+                                .take()
+                                .filter(|(_, at)| at.elapsed().as_secs_f32() < ROLL_SECS);
                         }
                         s.accounts.iter().any(|a| a.prev.is_some())
                     });
@@ -2180,7 +2949,8 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         let ready = with(|s| {
                             pinned
                                 || flyout::is_open()
-                                || s.hover_since.is_some_and(|at| at.elapsed().as_millis() >= 350)
+                                || s.hover_since
+                                    .is_some_and(|at| at.elapsed().as_millis() >= 350)
                         });
                         let redraw = with(|s| {
                             s.last_flyout_draw
@@ -2220,8 +2990,9 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                                 }
                                 let u = a.usage.clone().unwrap_or_default();
                                 [u.five_hour, u.weekly, u.fable].iter().flatten().any(|l| {
-                                    l.resets_at
-                                        .is_some_and(|t| t < now() && a.last_ok.is_some_and(|ok| ok < t))
+                                    l.resets_at.is_some_and(|t| {
+                                        t < now() && a.last_ok.is_some_and(|ok| ok < t)
+                                    })
                                 })
                             })
                             .map(|a| a.id)
@@ -2325,7 +3096,7 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             0
         }
         WM_LBUTTONUP => {
-            let x=(lp as i16) as i32;
+            let x = (lp as i16) as i32;
             let (group, host) = with(|s| {
                 (
                     s.group_ranges
@@ -2336,9 +3107,7 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 )
             });
             match group {
-                Some(render::Group::Codex) => {
-                    open_url("https://chatgpt.com/codex/settings/usage")
-                }
+                Some(render::Group::Codex) => open_url("https://chatgpt.com/codex/settings/usage"),
                 Some(render::Group::Spark) => open_url(&format!("http://{host}/")),
                 Some(render::Group::Claude) | None => open_usage_page(),
             }
