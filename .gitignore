@@ -1,1 +1,11 @@
 /target
+# Local working files, never commit
+HANDOFF.md
+.preview/
+.tmp*/
+.tmp-*.png
+.cargo-home/
+*.trn
+*.bmp
+state.json
+history.jsonl
