@@ -17,7 +17,8 @@ pub const WM_OPEN_PROVIDER: u32 = WM_APP + 31;
 pub const WM_DISMISSED: u32 = WM_APP + 32;
 const CLASS: *const u16 = w!("TaskbarUsageFlyout");
 const WM_MOUSE_LEAVE_MSG: u32 = 0x02A3;
-const MIN_WIDTH: f32 = 300.0;
+// About 80 percent of the old full-width card (MAX_WIDTH), left-aligned with the strip.
+const CARD_WIDTH: f32 = 440.0;
 const VERTICAL_MIN_WIDTH: f32 = 360.0;
 const MAX_WIDTH: f32 = 560.0;
 const WORK_MARGIN: f32 = 12.0;
@@ -469,7 +470,7 @@ unsafe fn desired_width(anchor: RECT, dpi: u32) -> i32 {
     let horizontal = anchor.right - anchor.left >= anchor.bottom - anchor.top;
     if horizontal {
         return (anchor.right - anchor.left)
-            .max((MIN_WIDTH * scale).round() as i32)
+            .max((CARD_WIDTH * scale).round() as i32)
             .min(work.right - work.left);
     }
     let available = if horizontal {
@@ -493,11 +494,7 @@ unsafe fn position(anchor: RECT, width: i32, height: i32, dpi: u32) -> POINT {
     let horizontal = anchor.right - anchor.left >= anchor.bottom - anchor.top;
     if horizontal {
         let card_gap = (12.0 * scale).round() as i32;
-        let x = if width > anchor.right - anchor.left {
-            anchor.right - width
-        } else {
-            anchor.left
-        };
+        let x = anchor.left;
         let y = if anchor.bottom <= work.top + 4 {
             anchor.bottom + card_gap
         } else {
@@ -538,7 +535,7 @@ unsafe fn position(anchor: RECT, width: i32, height: i32, dpi: u32) -> POINT {
 }
 
 pub fn render(snapshot: &Snapshot, dark: bool, dpi: u32, pinned: bool) -> (i32, i32, Vec<u32>) {
-    let width = (MIN_WIDTH * dpi as f32 / 96.0).round() as i32;
+    let width = (CARD_WIDTH * dpi as f32 / 96.0).round() as i32;
     render_at_width(snapshot, dark, dpi, pinned, width)
 }
 
@@ -788,8 +785,15 @@ fn panel_height(section: &Section) -> f32 {
         && section.provider != ProviderKind::Spark
     {
         let value = section.value.as_ref().unwrap();
-        body += 135.0
-            + if value.plan_usd.is_some() { 13.0 } else { 0.0 }
+        // Matches draw_value_block: separator 21, label 15, totals 18,
+        // "Today by project" 15, then 26 per project bar (up to 3).
+        body += 69.0
+            + 26.0 * value.projects.len().min(3) as f32
+            + if value.plan_usd.is_some_and(|p| p > 0.0) {
+                13.0
+            } else {
+                0.0
+            }
             + if !value.unpriced.is_empty() {
                 13.0
             } else {
@@ -1792,7 +1796,7 @@ unsafe fn draw_limit_block(
             .map(|time| format!("empty ~{time}"))
             .unwrap_or_else(|| format!("ends near {:.0}%", bar.projected));
         (
-            format!("\u{25B2} {ahead} ahead of pace \u{00b7} {ending}"),
+            format!("\u{25B2} {ahead} pts ahead of pace \u{00b7} {ending}"),
             if bar.full_at.is_some() {
                 palette.crit
             } else {
@@ -1802,7 +1806,7 @@ unsafe fn draw_limit_block(
     } else {
         (
             format!(
-                "\u{25BC} {} under pace \u{00b7} ends near {:.0}%",
+                "\u{25BC} {} pts under pace \u{00b7} ends near {:.0}%",
                 -ahead, bar.projected
             ),
             palette.good,
@@ -2426,13 +2430,16 @@ unsafe fn draw_content(
                     .unwrap_or_else(|| format!("ends near {:.0}%", bar.projected));
                 (
                     "▲",
-                    format!("{ahead} ahead of pace · {ending}"),
+                    format!("{ahead} pts ahead of pace · {ending}"),
                     if bar.full_at.is_some() { red } else { amber },
                 )
             } else {
                 (
                     "▼",
-                    format!("{} under pace · ends near {:.0}%", -ahead, bar.projected),
+                    format!(
+                        "{} pts under pace · ends near {:.0}%",
+                        -ahead, bar.projected
+                    ),
                     dim_green,
                 )
             };
@@ -3150,7 +3157,7 @@ mod tests {
 
     #[test]
     fn header_hit_testing_maps_controls_and_providers() {
-        let width = MIN_WIDTH as i32;
+        let width = CARD_WIDTH as i32;
         let sections = vec![
             Section {
                 provider: ProviderKind::Claude,
