@@ -1489,7 +1489,7 @@ unsafe fn draw_limit_block(
             .map(|time| format!("empty ~{time}"))
             .unwrap_or_else(|| format!("ends near {:.0}%", bar.projected));
         (
-            format!("\u{2197} {ahead} ahead of pace \u{00b7} {ending}"),
+            format!("\u{25B2} {ahead} ahead of pace \u{00b7} {ending}"),
             if bar.full_at.is_some() {
                 palette.crit
             } else {
@@ -1499,7 +1499,7 @@ unsafe fn draw_limit_block(
     } else {
         (
             format!(
-                "\u{2198} {} under pace \u{00b7} ends near {:.0}%",
+                "\u{25BC} {} under pace \u{00b7} ends near {:.0}%",
                 -ahead, bar.projected
             ),
             palette.good,
