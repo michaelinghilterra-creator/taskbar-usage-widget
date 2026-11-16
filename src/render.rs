@@ -52,6 +52,7 @@ pub fn palette(dark: bool) -> Palette {
 
 const RING_BLUE: Rgba = Rgba(0.298, 0.608, 0.961, 1.0); // #4C9BF5
 pub const CLAUDE_ORANGE: Rgba = Rgba(0.851, 0.467, 0.341, 1.0); // #D97757
+const SPARK_GREEN: Rgba = Rgba(0.463, 0.725, 0.0, 1.0); // #76B900
 
 /// One account's numbers.
 #[derive(Clone)]
@@ -1192,6 +1193,7 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         };
         let mark_color = match m.provider_mark {
             2 if m.spark_down => pal.crit,
+            2 if m.spark_busy => SPARK_GREEN,
             2 => pal.label,
             1 => RING_BLUE,
             _ => CLAUDE_ORANGE,
@@ -1259,26 +1261,56 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
     }
 }
 
-fn draw_codex_mark(size: i32) -> Vec<f32> {
-    let mut o = vec![0.0; (size * size) as usize];
-    let c = (size - 1) as f32 / 2.0;
-    let r = c * 0.82;
+pub(crate) fn draw_codex_mark(size: i32) -> Vec<f32> {
+    let mut out = vec![0.0; (size * size) as usize];
+    let n = size as f32;
+    let points = [
+        (n * 0.14, n * 0.50),
+        (n * 0.32, n * 0.18),
+        (n * 0.68, n * 0.18),
+        (n * 0.86, n * 0.50),
+        (n * 0.68, n * 0.82),
+        (n * 0.32, n * 0.82),
+    ];
+    let stroke = (n * 0.105).clamp(1.35, 1.8);
+    let prompt = [
+        ((n * 0.37, n * 0.36), (n * 0.50, n * 0.50)),
+        ((n * 0.50, n * 0.50), (n * 0.37, n * 0.64)),
+        ((n * 0.55, n * 0.65), (n * 0.69, n * 0.65)),
+    ];
+    let distance = |px: f32, py: f32, a: (f32, f32), b: (f32, f32)| {
+        let vx = b.0 - a.0;
+        let vy = b.1 - a.1;
+        let length_sq = vx * vx + vy * vy;
+        let t = (((px - a.0) * vx + (py - a.1) * vy) / length_sq).clamp(0.0, 1.0);
+        let dx = px - (a.0 + t * vx);
+        let dy = py - (a.1 + t * vy);
+        (dx * dx + dy * dy).sqrt()
+    };
+    let samples = 4;
     for y in 0..size {
         for x in 0..size {
-            let dx = x as f32 - c;
-            let dy = y as f32 - c;
-            let a = dy.atan2(dx);
-            let hex = r * (std::f32::consts::PI / 6.0).cos()
-                / ((a.rem_euclid(std::f32::consts::PI / 3.0) - std::f32::consts::PI / 6.0).cos());
-            let d = (dx * dx + dy * dy).sqrt();
-            if (d - hex).abs() < 1.4
-                || (d < r * 0.48 && ((dx + dy).abs() < 1.2 || (dx - dy).abs() < 1.2))
-            {
-                o[(y * size + x) as usize] = 1.0
+            let mut hits = 0;
+            for sy in 0..samples {
+                for sx in 0..samples {
+                    let px = x as f32 + (sx as f32 + 0.5) / samples as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / samples as f32;
+                    let mut d = f32::MAX;
+                    for i in 0..points.len() {
+                        d = d.min(distance(px, py, points[i], points[(i + 1) % points.len()]));
+                    }
+                    for &(a, b) in &prompt {
+                        d = d.min(distance(px, py, a, b));
+                    }
+                    if d <= stroke * 0.5 {
+                        hits += 1;
+                    }
+                }
             }
+            out[(y * size + x) as usize] = hits as f32 / (samples * samples) as f32;
         }
     }
-    o
+    out
 }
 fn draw_spark_mark(size: i32) -> Vec<f32> {
     let mut out = vec![0.0; (size * size) as usize];

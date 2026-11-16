@@ -1038,6 +1038,12 @@ fn tooltip_text(s: &State) -> String {
     out
 }
 
+fn json_is_active(value: &serde_json::Value) -> bool {
+    value.as_bool().unwrap_or(false)
+        || value.as_i64().is_some_and(|count| count > 0)
+        || value.as_u64().is_some_and(|count| count > 0)
+}
+
 fn flyout_snapshot(s: &State) -> flyout::Snapshot {
     let t = now();
     let mut sections = Vec::new();
@@ -1138,15 +1144,27 @@ fn flyout_snapshot(s: &State) -> flyout::Snapshot {
                 gpu_util: spark.gpu_util,
                 gpu_temp: spark.sys["gpu"]["temp"].as_f64(),
                 gpu_power: spark.sys["gpu"]["power"].as_f64(),
-                mem_pct: spark.sys["memory"]["pct"].as_f64(),
-                swap_pct: spark.sys["swap"]["pct"].as_f64(),
+                mem_pct: spark.host["mem_pct"]
+                    .as_f64()
+                    .or_else(|| spark.sys["memory"]["pct"].as_f64()),
+                swap_pct: spark.host["swap_pct"]
+                    .as_f64()
+                    .or_else(|| spark.sys["swap"]["pct"].as_f64()),
                 aux: spark
                     .aux
                     .iter()
                     .map(|service| flyout::AuxStatus {
-                        name: service["name"].as_str().unwrap_or("service").to_owned(),
+                        name: service["name"]
+                            .as_str()
+                            .unwrap_or("service")
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("service")
+                            .to_owned(),
                         up: service["up"].as_bool().unwrap_or(false),
-                        busy: service["busy"].as_bool().unwrap_or(false),
+                        busy: json_is_active(&service["running"])
+                            || json_is_active(&service["pending"])
+                            || service["busy"].as_bool().unwrap_or(false),
                     })
                     .collect(),
             });

@@ -270,6 +270,11 @@ unsafe fn draw_content(
     } else {
         rgb(238, 238, 241)
     };
+    let card_bg = if dark {
+        rgb(32, 32, 34)
+    } else {
+        rgb(248, 248, 250)
+    };
     let green = rgb(118, 185, 0);
     let dim_green = if dark {
         rgb(126, 174, 91)
@@ -317,6 +322,7 @@ unsafe fn draw_content(
             (14.0 * scale) as i32,
             section.provider,
             accent,
+            card_bg,
         );
         SelectObject(dc, semibold);
         draw_text(
@@ -357,8 +363,10 @@ unsafe fn draw_content(
             fill_round(dc, pad, bar_top, bar_width, bar_height, track);
             let fill_width =
                 ((bar_width as f64 * bar.percent.clamp(0.0, 100.0) / 100.0).round() as i32).max(2);
-            let fill = if dimmed {
+            let fill = if section.error.is_some() {
                 muted
+            } else if section.stale {
+                blend_color(track, accent, 0.58)
             } else if bar.percent > 95.0 {
                 red
             } else if bar.percent > 75.0 {
@@ -505,9 +513,11 @@ unsafe fn draw_content(
         if let Some(error) = &section.error {
             SelectObject(dc, small);
             draw_text(dc, pad, y, &format!("⚠ {error}"), muted);
+            y += (18.0 * scale) as i32;
         } else if section.stale {
             SelectObject(dc, small);
             draw_text(dc, pad, y, "⚠ Data is stale", muted);
+            y += (18.0 * scale) as i32;
         }
     }
 
@@ -639,7 +649,20 @@ unsafe fn draw_provider_mark(
     size: i32,
     provider: ProviderKind,
     color: COLORREF,
+    background: COLORREF,
 ) {
+    if provider == ProviderKind::Codex {
+        let mask = crate::render::draw_codex_mark(size);
+        for py in 0..size {
+            for px in 0..size {
+                let coverage = mask[(py * size + px) as usize];
+                if coverage > 0.0 {
+                    SetPixelV(dc, x + px, y + py, blend_color(background, color, coverage));
+                }
+            }
+        }
+        return;
+    }
     let pen = CreatePen(PS_SOLID, (size as f32 / 8.0).round().max(1.0) as i32, color);
     let old = SelectObject(dc, pen);
     let c = POINT {
@@ -653,34 +676,7 @@ unsafe fn draw_provider_mark(
                 LineTo(dc, c.x + dx, c.y + dy);
             }
         }
-        ProviderKind::Codex => {
-            let p = [
-                POINT { x: c.x - 6, y: c.y },
-                POINT {
-                    x: c.x - 3,
-                    y: c.y - 5,
-                },
-                POINT {
-                    x: c.x + 3,
-                    y: c.y - 5,
-                },
-                POINT { x: c.x + 6, y: c.y },
-                POINT {
-                    x: c.x + 3,
-                    y: c.y + 5,
-                },
-                POINT {
-                    x: c.x - 3,
-                    y: c.y + 5,
-                },
-                POINT { x: c.x - 6, y: c.y },
-            ];
-            Polyline(dc, p.as_ptr(), p.len() as i32);
-            MoveToEx(dc, c.x - 2, c.y - 2, null_mut());
-            LineTo(dc, c.x + 2, c.y + 2);
-            MoveToEx(dc, c.x + 2, c.y - 2, null_mut());
-            LineTo(dc, c.x - 2, c.y + 2);
-        }
+        ProviderKind::Codex => unreachable!(),
         ProviderKind::Spark => {
             RoundRect(dc, x + 3, y + 3, x + size - 3, y + size - 3, 3, 3);
             for o in [5, size - 5] {
@@ -779,7 +775,12 @@ unsafe fn draw_stat_grid(
         );
         if !detail.is_empty() {
             SelectObject(dc, small);
-            draw_text_right(dc, x + width - 6, y + (33.0 * scale) as i32, detail, muted);
+            let detail_y = if i == 0 {
+                y + 4
+            } else {
+                y + (33.0 * scale) as i32
+            };
+            draw_text_right(dc, x + width - 6, detail_y, detail, muted);
         }
     }
 }
@@ -811,12 +812,12 @@ unsafe fn draw_aux(
     SelectObject(dc, font);
     let mut x = left;
     for service in aux {
-        let state = if !service.up {
-            "down"
-        } else if service.busy {
+        let state = if service.busy {
             "busy"
-        } else {
+        } else if service.up {
             "idle"
+        } else {
+            "down"
         };
         let label = format!("● {} {state}", service.name);
         let width = text_width(dc, &label) + (12.0 * scale) as i32;
@@ -824,12 +825,12 @@ unsafe fn draw_aux(
             break;
         }
         fill_round(dc, x, top, width, (20.0 * scale) as i32, fill);
-        let color = if !service.up {
-            red
-        } else if service.busy {
+        let color = if service.busy {
             green
-        } else {
+        } else if service.up {
             text
+        } else {
+            red
         };
         draw_text(dc, x + (6.0 * scale) as i32, top + 2, &label, color);
         x += width + (6.0 * scale) as i32;

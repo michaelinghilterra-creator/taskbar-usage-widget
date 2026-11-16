@@ -113,12 +113,45 @@ fn taskbar_model(state: &Value, dark: bool, now: i64, spark_points: &[f32]) -> r
         show_codex: true,
         show_spark: spark.is_some(),
         spark_points: spark_points.to_vec(),
-        spark_busy: spark.is_some_and(|value| value["busy"].as_bool().unwrap_or(false)),
+        spark_busy: spark.is_some_and(spark_is_busy),
         spark_down: spark.is_some_and(|value| {
             value["error"].is_string() || !value["up"].as_bool().unwrap_or(false)
         }),
         spark_pulse_alpha: 1.0,
     }
+}
+
+fn json_is_active(value: &Value) -> bool {
+    value.as_bool().unwrap_or(false)
+        || value.as_i64().is_some_and(|count| count > 0)
+        || value.as_u64().is_some_and(|count| count > 0)
+}
+
+fn service_is_busy(service: &Value) -> bool {
+    service["busy"].as_bool().unwrap_or(false)
+        || json_is_active(&service["running"])
+        || json_is_active(&service["pending"])
+}
+
+fn short_service_name(service: &Value) -> String {
+    service["name"]
+        .as_str()
+        .unwrap_or("service")
+        .split_whitespace()
+        .next()
+        .unwrap_or("service")
+        .to_owned()
+}
+
+fn spark_is_busy(spark: &Value) -> bool {
+    let endpoint_busy = spark["endpoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|endpoint| json_is_active(&endpoint["running"]));
+    endpoint_busy
+        || spark["gpu_util"].as_f64().unwrap_or(0.0) > 30.0
+        || spark["sys"]["gpu"]["util"].as_f64().unwrap_or(0.0) > 30.0
 }
 
 fn row_from_windows(windows: &Value, now: i64) -> render::Row {
@@ -271,16 +304,20 @@ fn flyout_model(state: &Value, now: i64, spark_points: &[f32]) -> flyout::Snapsh
             gpu_util: spark["gpu_util"].as_f64().unwrap_or(0.0),
             gpu_temp: spark["sys"]["gpu"]["temp"].as_f64(),
             gpu_power: spark["sys"]["gpu"]["power"].as_f64(),
-            mem_pct: spark["sys"]["memory"]["pct"].as_f64(),
-            swap_pct: spark["sys"]["swap"]["pct"].as_f64(),
+            mem_pct: spark["host"]["mem_pct"]
+                .as_f64()
+                .or_else(|| spark["sys"]["memory"]["pct"].as_f64()),
+            swap_pct: spark["host"]["swap_pct"]
+                .as_f64()
+                .or_else(|| spark["sys"]["swap"]["pct"].as_f64()),
             aux: spark["aux"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .map(|service| flyout::AuxStatus {
-                    name: service["name"].as_str().unwrap_or("service").to_owned(),
+                    name: short_service_name(service),
                     up: service["up"].as_bool().unwrap_or(false),
-                    busy: service["busy"].as_bool().unwrap_or(false),
+                    busy: service_is_busy(service),
                 })
                 .collect(),
         });
@@ -384,14 +421,18 @@ fn fake_state(now: i64) -> Value {
         "_preview_fake": true,
         "written_at": now,
         "readings": [
-            {"provider":"claude","as_of":now,"windows":[window("5h","5-hour",62.0,18000),window("week","Weekly",38.0,604800)]},
+            {"provider":"claude","as_of":now-3600,"windows":[window("5h","5-hour",62.0,18000),window("week","Weekly",38.0,604800)]},
             {"provider":"codex","as_of":now-300,"plan_type":"plus","windows":[window("5h","5-hour",15.0,18000),window("week","Weekly",9.0,604800)]}
         ],
         "spark": {
             "fetched_at": now, "up": true, "tok_s": 84.0, "gpu_util": 67.0, "busy": true,
             "endpoints":[{"model":"local-model","engine":"vllm","running":1,"waiting":0,"kv_pct":22.0,"ttft_ms":41.0}],
-            "sys":{"gpu":{"temp":61.0,"power":205.0},"memory":{"pct":46.0},"swap":{"pct":12.0}},
-            "aux":[{"name":"Wan","up":true,"busy":false},{"name":"TTS","up":true,"busy":true}]
+            "host":{"mem_pct":46.0,"swap_pct":12.0},
+            "sys":{"gpu":{"temp":61.0,"power":205.0}},
+            "aux":[
+                {"name":"Wan 2.2 T2V A14B","up":true,"running":0,"pending":0},
+                {"name":"Chatterbox TTS","up":true,"running":1,"pending":0}
+            ]
         },
         "tokens":{"claude":1200000,"claude_output":84000,"codex":238000,"checked_at":now}
     })

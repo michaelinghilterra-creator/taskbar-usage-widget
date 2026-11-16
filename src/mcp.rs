@@ -284,7 +284,9 @@ fn compact_spark(value: &Value, time: i64) -> Value {
         "gpu_util": value["gpu_util"].as_f64().unwrap_or_else(|| value["sys"]["gpu"]["util"].as_f64().unwrap_or(0.0)),
         "gpu_temp": value["sys"]["gpu"]["temp"],
         "gpu_power": value["sys"]["gpu"]["power"],
-        "mem_pct": value["sys"]["memory"]["pct"],
+        "mem_pct": value["host"]["mem_pct"]
+            .as_f64()
+            .or_else(|| value["sys"]["memory"]["pct"].as_f64()),
         "busy": value["busy"].as_bool().unwrap_or(false),
         "aux": aux,
         "stale_secs": (time - value["fetched_at"].as_i64().unwrap_or(0)).max(0)
