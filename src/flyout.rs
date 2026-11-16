@@ -1,5 +1,5 @@
 use crate::http::wide;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ptr::{null, null_mut};
 use windows_sys::core::w;
 use windows_sys::Win32::Foundation::*;
@@ -7,20 +7,32 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_REFRESH: u32 = WM_APP + 30;
+pub const WM_OPEN_PROVIDER: u32 = WM_APP + 31;
+pub const WM_DISMISSED: u32 = WM_APP + 32;
 const CLASS: *const u16 = w!("TaskbarUsageFlyout");
 const WM_MOUSE_LEAVE_MSG: u32 = 0x02A3;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProviderKind {
     #[default]
     Claude,
     Codex,
     Spark,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderHit {
+    Close,
+    Pin,
+    Refresh,
+    Provider(ProviderKind),
+    None,
 }
 
 #[derive(Clone, Default)]
@@ -77,11 +89,79 @@ pub struct Snapshot {
     pub updated: String,
 }
 
+#[derive(Clone)]
+struct View {
+    snapshot: Snapshot,
+    dark: bool,
+    dpi: u32,
+}
+
 thread_local! {
     static WINDOW: Cell<HWND> = const { Cell::new(null_mut()) };
     static OWNER: Cell<HWND> = const { Cell::new(null_mut()) };
     static HOVER: Cell<bool> = const { Cell::new(false) };
     static PINNED: Cell<bool> = const { Cell::new(false) };
+    static CLICK_MODE: Cell<bool> = const { Cell::new(false) };
+    static HOVER_HIT: Cell<HeaderHit> = const { Cell::new(HeaderHit::None) };
+    static VIEW: RefCell<Option<View>> = const { RefCell::new(None) };
+}
+
+fn control_rects(width: i32, scale: f32) -> [(HeaderHit, RECT); 3] {
+    let pad = (16.0 * scale).round() as i32;
+    let size = (20.0 * scale).round() as i32;
+    let gap = (4.0 * scale).round() as i32;
+    let top = (8.0 * scale).round() as i32;
+    let bottom = top + size;
+    let close_right = width - pad;
+    let close = RECT {
+        left: close_right - size,
+        top,
+        right: close_right,
+        bottom,
+    };
+    let pin = RECT {
+        left: close.left - gap - size,
+        top,
+        right: close.left - gap,
+        bottom,
+    };
+    let refresh = RECT {
+        left: pin.left - gap - size,
+        top,
+        right: pin.left - gap,
+        bottom,
+    };
+    [
+        (HeaderHit::Close, close),
+        (HeaderHit::Pin, pin),
+        (HeaderHit::Refresh, refresh),
+    ]
+}
+
+fn contains(rect: RECT, x: i32, y: i32) -> bool {
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
+pub fn header_hit_test(x: i32, y: i32, width: i32, scale: f32, sections: &[Section]) -> HeaderHit {
+    for (hit, rect) in control_rects(width, scale) {
+        if contains(rect, x, y) {
+            return hit;
+        }
+    }
+    let pad = (16.0 * scale).round() as i32;
+    let provider_right = pad + (132.0 * scale).round() as i32;
+    let mut top = (44.0 * scale).round() as i32;
+    for (index, section) in sections.iter().enumerate() {
+        if index > 0 {
+            top += (15.0 * scale).round() as i32;
+        }
+        let bottom = top + (24.0 * scale).round() as i32;
+        if x >= pad && x < provider_right && y >= top && y < bottom {
+            return HeaderHit::Provider(section.provider);
+        }
+        top += (section_height(section) as f32 * scale).round() as i32;
+    }
+    HeaderHit::None
 }
 
 pub unsafe fn register() {
@@ -101,16 +181,42 @@ pub fn is_hovered() -> bool {
 pub fn is_pinned() -> bool {
     PINNED.with(Cell::get)
 }
+pub fn is_click_mode() -> bool {
+    CLICK_MODE.with(Cell::get)
+}
+pub fn is_persistent() -> bool {
+    is_pinned() || is_click_mode()
+}
 pub fn is_open() -> bool {
     WINDOW.with(|window| unsafe { !window.get().is_null() && IsWindowVisible(window.get()) != 0 })
 }
 pub unsafe fn hide() {
-    if !is_pinned() {
+    if !is_persistent() {
         WINDOW.with(|window| ShowWindow(window.get(), SW_HIDE));
     }
 }
 
+pub unsafe fn close() {
+    PINNED.with(|pinned| pinned.set(false));
+    CLICK_MODE.with(|mode| mode.set(false));
+    HOVER_HIT.with(|hit| hit.set(HeaderHit::None));
+    WINDOW.with(|window| {
+        if !window.get().is_null() {
+            ShowWindow(window.get(), SW_HIDE);
+        }
+    });
+}
+
 pub unsafe fn show(snapshot: &Snapshot, anchor: RECT, dark: bool, owner: HWND) {
+    show_impl(snapshot, anchor, dark, owner, is_click_mode());
+}
+
+pub unsafe fn show_click(snapshot: &Snapshot, anchor: RECT, dark: bool, owner: HWND) {
+    CLICK_MODE.with(|mode| mode.set(true));
+    show_impl(snapshot, anchor, dark, owner, true);
+}
+
+unsafe fn show_impl(snapshot: &Snapshot, anchor: RECT, dark: bool, owner: HWND, click: bool) {
     let hwnd = WINDOW.with(|slot| {
         let mut hwnd = slot.get();
         if hwnd.is_null() || IsWindow(hwnd) == 0 {
@@ -136,9 +242,38 @@ pub unsafe fn show(snapshot: &Snapshot, anchor: RECT, dark: bool, owner: HWND) {
     if hwnd.is_null() {
         return;
     }
-    let frame = render(snapshot, dark, GetDpiForWindow(owner).max(96), is_pinned());
+    let dpi = GetDpiForWindow(owner).max(96);
+    VIEW.with(|view| {
+        *view.borrow_mut() = Some(View {
+            snapshot: snapshot.clone(),
+            dark,
+            dpi,
+        });
+    });
+    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    let style = if click {
+        style & !WS_EX_NOACTIVATE
+    } else {
+        style | WS_EX_NOACTIVATE
+    };
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize);
+    SetWindowPos(
+        hwnd,
+        null_mut(),
+        0,
+        0,
+        0,
+        0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    let frame = render_with_hover(snapshot, dark, dpi, is_pinned(), HOVER_HIT.with(Cell::get));
     present(hwnd, position(anchor, frame.0, frame.1), frame);
-    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    if click {
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+    } else {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
 }
 
 unsafe fn position(anchor: RECT, width: i32, height: i32) -> POINT {
@@ -166,6 +301,16 @@ unsafe fn position(anchor: RECT, width: i32, height: i32) -> POINT {
 }
 
 pub fn render(snapshot: &Snapshot, dark: bool, dpi: u32, pinned: bool) -> (i32, i32, Vec<u32>) {
+    render_with_hover(snapshot, dark, dpi, pinned, HeaderHit::None)
+}
+
+fn render_with_hover(
+    snapshot: &Snapshot,
+    dark: bool,
+    dpi: u32,
+    pinned: bool,
+    hovered: HeaderHit,
+) -> (i32, i32, Vec<u32>) {
     let scale = dpi as f32 / 96.0;
     let width = (360.0 * scale).round() as i32;
     let sections: i32 = snapshot.sections.iter().map(section_height).sum();
@@ -185,7 +330,18 @@ pub fn render(snapshot: &Snapshot, dark: bool, dpi: u32, pinned: bool) -> (i32, 
             }
         }
     }
-    unsafe { draw_content(&mut pixels, width, height, snapshot, dark, scale, pinned) };
+    unsafe {
+        draw_content(
+            &mut pixels,
+            width,
+            height,
+            snapshot,
+            dark,
+            scale,
+            pinned,
+            hovered,
+        )
+    };
     (width, height, pixels)
 }
 
@@ -231,6 +387,7 @@ unsafe fn draw_content(
     dark: bool,
     scale: f32,
     pinned: bool,
+    hovered: HeaderHit,
 ) {
     let dc = CreateCompatibleDC(null_mut());
     let mut bits = null_mut();
@@ -290,19 +447,43 @@ unsafe fn draw_content(
     let pad = (16.0 * scale) as i32;
     let mut y = (14.0 * scale) as i32;
 
+    let controls = control_rects(width, scale);
+    for (hit, rect) in controls {
+        if hit == hovered {
+            fill_round(
+                dc,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                tile,
+            );
+        }
+    }
+
     SelectObject(dc, header);
     draw_text(dc, pad, y, "Usage", text);
     SelectObject(dc, small);
-    let controls_left = width - pad - (50.0 * scale) as i32;
+    let controls_left = controls[2].1.left;
     draw_text_right(dc, controls_left - 6, y + 2, &snapshot.updated, muted);
     SelectObject(dc, normal);
-    draw_text(dc, controls_left, y, "↻", muted);
+    let refresh = controls[2].1;
+    draw_text(dc, refresh.left + (4.0 * scale) as i32, y, "↻", muted);
+    let pin = controls[1].1;
     draw_pin(
         dc,
-        width - pad - (13.0 * scale) as i32,
+        pin.left + (5.0 * scale) as i32,
         y + 1,
         scale,
         pinned,
+        muted,
+    );
+    let close = controls[0].1;
+    draw_close(
+        dc,
+        close.left + (4.0 * scale) as i32,
+        close.top + (4.0 * scale) as i32,
+        scale,
         muted,
     );
     y += (30.0 * scale) as i32;
@@ -716,6 +897,18 @@ unsafe fn draw_pin(dc: HDC, x: i32, y: i32, scale: f32, pinned: bool, color: COL
     DeleteObject(pen);
 }
 
+unsafe fn draw_close(dc: HDC, x: i32, y: i32, scale: f32, color: COLORREF) {
+    let size = (10.0 * scale).round() as i32;
+    let pen = CreatePen(PS_SOLID, (1.3 * scale).round().max(1.0) as i32, color);
+    let old = SelectObject(dc, pen);
+    MoveToEx(dc, x, y, null_mut());
+    LineTo(dc, x + size, y + size);
+    MoveToEx(dc, x + size, y, null_mut());
+    LineTo(dc, x, y + size);
+    SelectObject(dc, old);
+    DeleteObject(pen);
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_stat_grid(
     dc: HDC,
@@ -930,11 +1123,92 @@ unsafe fn present(hwnd: HWND, point: POINT, frame: (i32, i32, Vec<u32>)) {
     ReleaseDC(null_mut(), screen);
 }
 
-unsafe extern "system" fn proc_(hwnd: HWND, message: u32, _wp: WPARAM, lp: LPARAM) -> LRESULT {
+unsafe fn redraw(hwnd: HWND) {
+    let view = VIEW.with(|view| view.borrow().clone());
+    let Some(view) = view else {
+        return;
+    };
+    let mut window: RECT = std::mem::zeroed();
+    GetWindowRect(hwnd, &mut window);
+    let frame = render_with_hover(
+        &view.snapshot,
+        view.dark,
+        view.dpi,
+        is_pinned(),
+        HOVER_HIT.with(Cell::get),
+    );
+    present(
+        hwnd,
+        POINT {
+            x: window.left,
+            y: window.top,
+        },
+        frame,
+    );
+}
+
+unsafe fn hit_at(hwnd: HWND, x: i32, y: i32) -> HeaderHit {
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client);
+    VIEW.with(|view| {
+        view.borrow().as_ref().map_or(HeaderHit::None, |view| {
+            header_hit_test(
+                x,
+                y,
+                client.right,
+                view.dpi as f32 / 96.0,
+                &view.snapshot.sections,
+            )
+        })
+    })
+}
+
+unsafe fn dismiss(hwnd: HWND) {
+    close();
+    OWNER.with(|owner| PostMessageW(owner.get(), WM_DISMISSED, 0, 0));
+    SetWindowLongPtrW(
+        hwnd,
+        GWL_EXSTYLE,
+        (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 | WS_EX_NOACTIVATE) as isize,
+    );
+}
+
+unsafe extern "system" fn proc_(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match message {
-        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_MOUSEACTIVATE => {
+            if is_click_mode() {
+                MA_ACTIVATE as LRESULT
+            } else {
+                MA_NOACTIVATE as LRESULT
+            }
+        }
+        WM_ACTIVATE => {
+            if (wp & 0xffff) as u32 == WA_INACTIVE && is_click_mode() && !is_pinned() {
+                dismiss(hwnd);
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            if wp == VK_ESCAPE as usize {
+                dismiss(hwnd);
+                return 0;
+            }
+            DefWindowProcW(hwnd, message, wp, lp)
+        }
         WM_MOUSEMOVE => {
             HOVER.with(|h| h.set(true));
+            let x = lp as i16 as i32;
+            let y = (lp >> 16) as i16 as i32;
+            let hit = hit_at(hwnd, x, y);
+            if HOVER_HIT.with(|old| old.replace(hit)) != hit {
+                redraw(hwnd);
+            }
+            let cursor = if hit == HeaderHit::None {
+                IDC_ARROW
+            } else {
+                IDC_HAND
+            };
+            SetCursor(LoadCursorW(null_mut(), cursor));
             let mut e = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                 dwFlags: TME_LEAVE,
@@ -946,19 +1220,32 @@ unsafe extern "system" fn proc_(hwnd: HWND, message: u32, _wp: WPARAM, lp: LPARA
         }
         WM_MOUSE_LEAVE_MSG => {
             HOVER.with(|h| h.set(false));
+            if HOVER_HIT.with(|hit| hit.replace(HeaderHit::None)) != HeaderHit::None {
+                redraw(hwnd);
+            }
             0
         }
         WM_LBUTTONDOWN => {
             let x = lp as i16 as i32;
             let y = (lp >> 16) as i16 as i32;
-            let mut r: RECT = std::mem::zeroed();
-            GetClientRect(hwnd, &mut r);
-            if y < 38 && x > r.right - 50 {
-                PINNED.with(|p| p.set(!p.get()));
-            } else if y < 38 && is_pinned() {
-                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
-            } else if y < 38 && x > r.right - 90 {
-                OWNER.with(|o| PostMessageW(o.get(), WM_REFRESH, 0, 0));
+            match hit_at(hwnd, x, y) {
+                HeaderHit::Close => dismiss(hwnd),
+                HeaderHit::Pin => {
+                    PINNED.with(|pinned| pinned.set(!pinned.get()));
+                    redraw(hwnd);
+                }
+                HeaderHit::Refresh => {
+                    OWNER.with(|o| PostMessageW(o.get(), WM_REFRESH, 0, 0));
+                }
+                HeaderHit::Provider(provider) => {
+                    OWNER.with(|owner| {
+                        PostMessageW(owner.get(), WM_OPEN_PROVIDER, provider as usize, 0)
+                    });
+                }
+                HeaderHit::None if y < 38 && is_pinned() => {
+                    SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+                }
+                HeaderHit::None => {}
             }
             0
         }
@@ -967,5 +1254,48 @@ unsafe extern "system" fn proc_(hwnd: HWND, message: u32, _wp: WPARAM, lp: LPARA
             0
         }
         _ => DefWindowProcW(hwnd, message, 0, lp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_hit_testing_maps_controls_and_providers() {
+        let sections = vec![
+            Section {
+                provider: ProviderKind::Claude,
+                ..Default::default()
+            },
+            Section {
+                provider: ProviderKind::Codex,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            header_hit_test(336, 18, 360, 1.0, &sections),
+            HeaderHit::Close
+        );
+        assert_eq!(
+            header_hit_test(312, 18, 360, 1.0, &sections),
+            HeaderHit::Pin
+        );
+        assert_eq!(
+            header_hit_test(288, 18, 360, 1.0, &sections),
+            HeaderHit::Refresh
+        );
+        assert_eq!(
+            header_hit_test(28, 50, 360, 1.0, &sections),
+            HeaderHit::Provider(ProviderKind::Claude)
+        );
+        assert_eq!(
+            header_hit_test(28, 171, 360, 1.0, &sections),
+            HeaderHit::Provider(ProviderKind::Codex)
+        );
+        assert_eq!(
+            header_hit_test(180, 50, 360, 1.0, &sections),
+            HeaderHit::None
+        );
     }
 }

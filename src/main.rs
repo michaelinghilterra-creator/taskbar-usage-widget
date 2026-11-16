@@ -826,6 +826,13 @@ fn ensure_widget() {
             w = frame.w;
             wh = frame.h;
             present(widget, &frame);
+            debug_assert!(frame.groups.iter().all(|range| {
+                range.x0 < range.x1
+                    && matches!(
+                        range.group,
+                        render::Group::Claude | render::Group::Codex | render::Group::Spark
+                    )
+            }));
             with(|s| {
                 s.group_ranges = frame.groups.clone();
                 s.rendered = Some(key);
@@ -1263,6 +1270,10 @@ fn same_local_day(left: i64, right: i64) -> bool {
 }
 
 unsafe fn update_flyout() {
+    show_flyout(false);
+}
+
+unsafe fn show_flyout(click: bool) {
     let (widget, dark, snapshot) = with(|state| (state.widget, state.dark, flyout_snapshot(state)));
     if widget.is_null() {
         return;
@@ -1270,7 +1281,11 @@ unsafe fn update_flyout() {
     let mut anchor: RECT = std::mem::zeroed();
     GetWindowRect(widget, &mut anchor);
     let ctl = with(|state| state.ctl);
-    flyout::show(&snapshot, anchor, dark, ctl);
+    if click {
+        flyout::show_click(&snapshot, anchor, dark, ctl);
+    } else {
+        flyout::show(&snapshot, anchor, dark, ctl);
+    }
     with(|state| state.last_flyout_draw = Some(Instant::now()));
 }
 
@@ -2961,11 +2976,11 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 T_FLYOUT => {
                     let widget_hover = with(|s| s.hover);
                     let flyout_hover = flyout::is_hovered();
-                    let pinned = flyout::is_pinned();
-                    if widget_hover || flyout_hover || pinned {
+                    let persistent = flyout::is_persistent();
+                    if widget_hover || flyout_hover || persistent {
                         with(|s| s.leave_since = None);
                         let ready = with(|s| {
-                            pinned
+                            persistent
                                 || flyout::is_open()
                                 || s.hover_since
                                     .is_some_and(|at| at.elapsed().as_millis() >= 350)
@@ -3055,6 +3070,33 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             start_provider_fetch();
             0
         }
+        flyout::WM_OPEN_PROVIDER => {
+            match wp {
+                value if value == flyout::ProviderKind::Claude as usize => {
+                    open_url("https://claude.ai/settings/usage");
+                }
+                value if value == flyout::ProviderKind::Codex as usize => {
+                    open_url("https://chatgpt.com/codex/settings/usage");
+                }
+                value if value == flyout::ProviderKind::Spark as usize => {
+                    let host = with(|state| state.spark_host.clone());
+                    if !host.is_empty() {
+                        open_url(&format!("http://{host}/"));
+                    }
+                }
+                _ => {}
+            }
+            0
+        }
+        flyout::WM_DISMISSED => {
+            with(|state| {
+                state.hover_since = None;
+                state.leave_since = None;
+                state.last_flyout_draw = None;
+            });
+            KillTimer(hwnd, T_FLYOUT);
+            0
+        }
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
             with(|s| s.dark = system_dark());
             ensure_widget();
@@ -3114,20 +3156,18 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             0
         }
         WM_LBUTTONUP => {
-            let x = (lp as i16) as i32;
-            let (group, host) = with(|s| {
-                (
-                    s.group_ranges
-                        .iter()
-                        .find(|range| x >= range.x0 && x < range.x1)
-                        .map(|range| range.group),
-                    s.spark_host.clone(),
-                )
-            });
-            match group {
-                Some(render::Group::Codex) => open_url("https://chatgpt.com/codex/settings/usage"),
-                Some(render::Group::Spark) => open_url(&format!("http://{host}/")),
-                Some(render::Group::Claude) | None => open_usage_page(),
+            let ctl = with(|state| state.ctl);
+            if flyout::is_open() && flyout::is_persistent() {
+                flyout::close();
+                with(|state| {
+                    state.hover_since = None;
+                    state.leave_since = None;
+                    state.last_flyout_draw = None;
+                });
+                KillTimer(ctl, T_FLYOUT);
+            } else {
+                show_flyout(true);
+                SetTimer(ctl, T_FLYOUT, 100, None);
             }
             0
         }

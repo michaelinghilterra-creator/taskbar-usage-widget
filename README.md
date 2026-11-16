@@ -42,7 +42,8 @@ API keys and the Claude desktop app / claude.ai alone aren't supported.
 
 <img src="docs/screenshot-menu.png" alt="The widget's right-click menu" width="377">
 
-- **Hover** for details, **left-click** to open your usage page on claude.ai.
+- **Hover** for a non-activating preview. **Left-click** toggles a focused details card that stays open until you click the widget again, press **Esc**, click its close button, or switch to another window. Pin the card to keep it open when focus changes.
+- Click a provider heading inside the card to open its usage page (or the configured Spark host).
 - **Right-click** to show or hide providers, set the Spark address, refresh, customize the look, manage Claude accounts, start with Windows, or exit.
 
 ### Multiple accounts
