@@ -20,6 +20,8 @@ These images use invented sample data.
 
 It is one file of about 1 MB. There is no installer. Each release lists a SHA-256 checksum.
 
+The widget never checks for updates on its own. To hear about new versions, click **Watch**, then **Custom**, then **Releases** at the top of this page. To update, replace the exe with the new one; your settings and history are kept.
+
 > **"Windows protected your PC"?** The exe is not code-signed. Click **More info**, then **Run anyway**, or [build it yourself](#build-from-source).
 
 ## What makes it different
