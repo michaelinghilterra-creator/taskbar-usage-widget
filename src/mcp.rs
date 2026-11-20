@@ -69,7 +69,13 @@ pub fn serve<R: BufRead, W: Write>(input: R, mut output: W) -> io::Result<()> {
                             | "recommend_worker"
                     )
                 ) {
-                    let headroom = usage_headroom(now());
+                    let mut headroom = usage_headroom(now());
+                    // Text below comes from servers, not from the user: strip
+                    // control characters everywhere and keep server-reported
+                    // names short so they cannot carry instructions.
+                    clean_strings(&mut headroom, 300);
+                    clean_strings(&mut headroom["spark"], 80);
+                    clean_strings(&mut headroom["local_servers"], 80);
                     let result = match name {
                         Some("get_spark_status") => headroom["spark"].clone(),
                         Some("get_local_servers") => headroom["local_servers"].clone(),
@@ -106,6 +112,23 @@ pub fn serve<R: BufRead, W: Write>(input: R, mut output: W) -> io::Result<()> {
         write_json(&mut output, &response)?;
     }
     Ok(())
+}
+
+/// Replaces control characters with spaces and truncates the text.
+pub fn clean_text(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max_chars)
+        .collect()
+}
+
+fn clean_strings(value: &mut Value, max_chars: usize) {
+    match value {
+        Value::String(text) => *text = clean_text(text, max_chars),
+        Value::Array(items) => items.iter_mut().for_each(|v| clean_strings(v, max_chars)),
+        Value::Object(map) => map.values_mut().for_each(|v| clean_strings(v, max_chars)),
+        _ => {}
+    }
 }
 
 fn write_json(output: &mut impl Write, value: &Value) -> io::Result<()> {
@@ -522,6 +545,17 @@ fn title(provider: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_text_is_cleaned_and_capped() {
+        let long = format!("m\n\u{1b}[0m{}", "x".repeat(500));
+        let mut value = json!({"local_servers":[{"model":long,"running":2}]});
+        clean_strings(&mut value["local_servers"], 80);
+        let model = value["local_servers"][0]["model"].as_str().unwrap();
+        assert_eq!(model.chars().count(), 80);
+        assert!(!model.chars().any(char::is_control));
+        assert_eq!(value["local_servers"][0]["running"], 2);
+    }
     use std::io::Cursor;
 
     fn exchange(lines: &str) -> Vec<Value> {

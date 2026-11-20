@@ -143,6 +143,8 @@ To undo the hook, delete these `UserPromptSubmit` and `SessionStart` entries.
 - The Codex login is read only. It is never refreshed or written. The Claude Code login is read from its credentials file. When the token is near expiry or rejected, the widget follows Claude Code's refresh flow and atomically writes the refreshed login back to that same file.
 - It writes `state.json`, `history.jsonl`, `value.json` and `hook-state.json` under `%LOCALAPPDATA%\TaskbarUsageWidget\`. Settings are stored under `HKEY_CURRENT_USER\Software\TaskbarUsageWidget`.
 - Tokens are never logged. There are no analytics and no update checks.
+- Login tokens are sent only over HTTPS with certificate checks on. The widget never follows redirects, caps every reply at 8 MB, and opens only `http` and `https` links.
+- Text reported by local servers, such as model names, is stripped of control characters and shortened before it reaches Claude Code through MCP.
 
 MCP mode reads the widget's local `state.json`, local Codex rollout metadata, and the configured local servers only. It never reads Claude credentials or refreshes Claude tokens, and it labels Claude logins as `account 1`, `account 2`, and so on instead of exposing email addresses or paths.
 

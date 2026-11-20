@@ -60,7 +60,7 @@ fn run_inner() -> Result<(), ()> {
     };
     let output = json!({"hookSpecificOutput": {
         "hookEventName": event.as_str(),
-        "additionalContext": text.chars().take(599).collect::<String>()
+        "additionalContext": crate::mcp::clean_text(&text, 599)
     }});
     let mut stdout = io::stdout().lock();
     let _ = serde_json::to_writer(&mut stdout, &output);
@@ -75,6 +75,7 @@ fn title(value: &str) -> &str {
         "claude" => "Claude",
         "codex" => "Codex",
         "spark" => "Spark",
+        value if value.starts_with("local:") => &value["local:".len()..],
         _ => "Conserve",
     }
 }

@@ -389,7 +389,8 @@ pub fn fetch_codex(now: i64, suppress_auth_mtime: Option<i64>) -> CodexFetch {
         };
     }
     let url = codex_usage_url();
-    let Some((host, port, path, secure)) = split_http_url(&url) else {
+    // The login token is only ever sent over HTTPS, whatever config.toml says.
+    let Some((host, port, path, secure)) = split_http_url(&url).filter(|parts| parts.3) else {
         return CodexFetch {
             reading: log_fallback(now, Some("Invalid Codex usage URL".into())),
             status: CodexFetchStatus::Fallback,

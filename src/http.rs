@@ -4,6 +4,10 @@ use std::ffi::c_void;
 use std::ptr::null;
 use windows_sys::Win32::Networking::WinHttp::*;
 
+/// Largest response body accepted. Usage and metrics replies are far smaller;
+/// the cap stops a misbehaving server from exhausting memory.
+const MAX_BODY: usize = 8 * 1024 * 1024;
+
 pub struct Response {
     pub status: u32,
     pub body: Vec<u8>,
@@ -87,6 +91,18 @@ pub fn request_to(
             ),
             "open request",
         )?;
+        // Never follow redirects or keep cookies: a redirect would resend the
+        // request headers (which can carry a login token) to another address.
+        let disable: u32 = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES;
+        if WinHttpSetOption(
+            req.0,
+            WINHTTP_OPTION_DISABLE_FEATURE,
+            &disable as *const u32 as *const c_void,
+            4,
+        ) == 0
+        {
+            return Err(format!("request setup failed ({})", last_error()));
+        }
         let hdrs = wide(headers);
         let (bptr, blen) = match body {
             Some(b) => (b.as_ptr() as *const c_void, b.len() as u32),
@@ -118,6 +134,9 @@ pub fn request_to(
                 break;
             }
             let start = out.len();
+            if start + avail as usize > MAX_BODY {
+                return Err("response too large".into());
+            }
             out.resize(start + avail as usize, 0);
             let mut read = 0u32;
             if WinHttpReadData(
