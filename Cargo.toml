@@ -1,6 +1,6 @@
 [package]
 name = "taskbar-usage-widget"
-version = "1.3.0"
+version = "2.0.0"
 description = "Claude, Codex and Spark usage in the Windows taskbar"
 license = "MIT"
 repository = "https://github.com/michaelinghilterra-creator/taskbar-usage-widget"

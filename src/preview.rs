@@ -103,7 +103,7 @@ fn write_flyout_states(path: &Path, dark: bool, now: i64, spark_points: &[f32]) 
     mixed.sections.push(flyout::Section {
         provider: flyout::ProviderKind::Spark,
         title: "Offline Lab".into(),
-        chip: "vllm · invented/offline".into(),
+        chip: "vllm · Qwen/Qwen3-8B".into(),
         error: Some("unreachable".into()),
         spark: Some(flyout::SparkStats::default()),
         ..Default::default()
@@ -698,7 +698,7 @@ fn fake_state(now: i64) -> Value {
         ],
         "spark": {
             "name":"Spark", "type":"spark-dash", "fetched_at": now, "up": true, "tok_s": 84.0, "gpu_util": 67.0, "busy": true,
-            "endpoints":[{"model":"invented/spark-model","engine":"spark-dash","running":1,"waiting":0,"kv_pct":22.0,"ttft_ms":41.0}],
+            "endpoints":[{"model":"Qwen/Qwen3-30B-A3B","engine":"spark-dash","running":1,"waiting":0,"kv_pct":22.0,"ttft_ms":41.0}],
             "host":{"mem_pct":46.0,"swap_pct":12.0},
             "sys":{"gpu":{"temp":61.0,"power":205.0}},
             "aux":[
@@ -710,7 +710,7 @@ fn fake_state(now: i64) -> Value {
             {
                 "name":"Spark", "url":"http://gpu-box.local:8000", "type":"spark-dash",
                 "fetched_at":now, "up":true, "tok_s":84.0, "gpu_util":67.0, "busy":true,
-                "endpoints":[{"model":"invented/spark-model","engine":"spark-dash","running":1,"waiting":0,"kv_pct":22.0,"ttft_ms":41.0}],
+                "endpoints":[{"model":"Qwen/Qwen3-30B-A3B","engine":"spark-dash","running":1,"waiting":0,"kv_pct":22.0,"ttft_ms":41.0}],
                 "host":{"mem_pct":46.0,"swap_pct":12.0},
                 "sys":{"gpu":{"temp":61.0,"power":205.0}},
                 "aux":[{"name":"Render","up":true,"running":0,"pending":0},{"name":"Speech","up":true,"running":1,"pending":0}]
@@ -718,7 +718,7 @@ fn fake_state(now: i64) -> Value {
             {
                 "name":"Ollama", "url":"http://10.0.0.5:11434", "type":"ollama",
                 "fetched_at":now, "up":true, "tok_s":0.0, "busy":false,
-                "endpoints":[{"model":"invented/chat-a","models":["invented/chat-a","invented/chat-b"],"memory_bytes":12884901888u64}],
+                "endpoints":[{"model":"llama3.1:8b","models":["llama3.1:8b","qwen3:4b"],"memory_bytes":12884901888u64}],
                 "host":{"memory_bytes":12884901888u64}
             }
         ],

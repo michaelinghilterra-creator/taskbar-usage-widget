@@ -8,6 +8,8 @@ fn main() {
     println!("cargo:rerun-if-changed=app.manifest");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+    // Record only the PDB file name, not the builder's full local path.
+    println!("cargo:rustc-link-arg-bins=/PDBALTPATH:%_PDB%");
     println!(
         "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
         manifest.display()
